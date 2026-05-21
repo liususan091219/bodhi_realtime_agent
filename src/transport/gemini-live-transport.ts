@@ -42,6 +42,16 @@ export interface GeminiTransportConfig {
 	connectTimeoutMs?: number;
 	/** Timeout in ms for the overall reconnect operation (default: 45000). */
 	reconnectTimeoutMs?: number;
+	/** Gemini automatic-VAD tuning — passed through as
+	 *  realtimeInputConfig.automaticActivityDetection. Lets the caller shorten
+	 *  silenceDurationMs so end-of-speech (turn end) is detected faster. */
+	vadConfig?: {
+		disabled?: boolean;
+		startOfSpeechSensitivity?: string;
+		endOfSpeechSensitivity?: string;
+		prefixPaddingMs?: number;
+		silenceDurationMs?: number;
+	};
 }
 
 /** Callbacks fired by GeminiLiveTransport when server messages arrive. */
@@ -198,6 +208,12 @@ export class GeminiLiveTransport implements LLMTransport {
 			connectConfig.contextWindowCompression = {
 				triggerTokens: this.config.compressionConfig.triggerTokens,
 				slidingWindow: { targetTokens: this.config.compressionConfig.targetTokens },
+			};
+		}
+
+		if (this.config.vadConfig) {
+			connectConfig.realtimeInputConfig = {
+				automaticActivityDetection: this.config.vadConfig,
 			};
 		}
 

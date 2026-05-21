@@ -1815,6 +1815,16 @@ interface VoiceSessionConfig {
         triggerTokens: number;
         targetTokens: number;
     };
+    /** Gemini automatic-VAD tuning — passed through to the Live API as
+     *  realtimeInputConfig.automaticActivityDetection. Shorten silenceDurationMs
+     *  to make end-of-turn detection (and thus the bot's reply) faster. */
+    vadConfig?: {
+        disabled?: boolean;
+        startOfSpeechSensitivity?: string;
+        endOfSpeechSensitivity?: string;
+        prefixPaddingMs?: number;
+        silenceDurationMs?: number;
+    };
     /** Enable server-side transcription of user audio input (default: true).
      *  Has no effect when sttProvider is set (built-in is disabled automatically).
      *  Use false to disable all input transcription for privacy or cost control. */
@@ -2142,6 +2152,16 @@ interface GeminiTransportConfig {
     connectTimeoutMs?: number;
     /** Timeout in ms for the overall reconnect operation (default: 45000). */
     reconnectTimeoutMs?: number;
+    /** Gemini automatic-VAD tuning — passed through as
+     *  realtimeInputConfig.automaticActivityDetection. Lets the caller shorten
+     *  silenceDurationMs so end-of-speech (turn end) is detected faster. */
+    vadConfig?: {
+        disabled?: boolean;
+        startOfSpeechSensitivity?: string;
+        endOfSpeechSensitivity?: string;
+        prefixPaddingMs?: number;
+        silenceDurationMs?: number;
+    };
 }
 /** Callbacks fired by GeminiLiveTransport when server messages arrive. */
 interface GeminiTransportCallbacks {

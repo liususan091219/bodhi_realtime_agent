@@ -55,6 +55,16 @@ export interface VoiceSessionConfig {
 	speechConfig?: { voiceName?: string };
 	/** Context window compression thresholds. */
 	compressionConfig?: { triggerTokens: number; targetTokens: number };
+	/** Gemini automatic-VAD tuning — passed through to the Live API as
+	 *  realtimeInputConfig.automaticActivityDetection. Shorten silenceDurationMs
+	 *  to make end-of-turn detection (and thus the bot's reply) faster. */
+	vadConfig?: {
+		disabled?: boolean;
+		startOfSpeechSensitivity?: string;
+		endOfSpeechSensitivity?: string;
+		prefixPaddingMs?: number;
+		silenceDurationMs?: number;
+	};
 	/** Enable server-side transcription of user audio input (default: true).
 	 *  Has no effect when sttProvider is set (built-in is disabled automatically).
 	 *  Use false to disable all input transcription for privacy or cost control. */
@@ -273,6 +283,7 @@ export class VoiceSession {
 					googleSearch: initialAgent?.googleSearch,
 					speechConfig: config.speechConfig,
 					compressionConfig: config.compressionConfig,
+					vadConfig: config.vadConfig,
 					inputAudioTranscription: inputTranscription,
 				},
 				{},
