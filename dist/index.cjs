@@ -2385,6 +2385,11 @@ var GeminiLiveTransport = class {
         slidingWindow: { targetTokens: this.config.compressionConfig.targetTokens }
       };
     }
+    if (this.config.vadConfig) {
+      connectConfig.realtimeInputConfig = {
+        automaticActivityDetection: this.config.vadConfig
+      };
+    }
     this.session = await this.ai.live.connect({
       model,
       config: connectConfig,
@@ -2938,6 +2943,7 @@ var VoiceSession = class _VoiceSession {
           googleSearch: initialAgent?.googleSearch,
           speechConfig: config.speechConfig,
           compressionConfig: config.compressionConfig,
+          vadConfig: config.vadConfig,
           inputAudioTranscription: inputTranscription
         },
         {}
