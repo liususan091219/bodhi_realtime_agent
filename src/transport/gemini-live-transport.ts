@@ -52,6 +52,12 @@ export interface GeminiTransportConfig {
 		prefixPaddingMs?: number;
 		silenceDurationMs?: number;
 	};
+	/** Gemini activity handling — passed through as
+	 *  realtimeInputConfig.activityHandling. 'NO_INTERRUPTION' keeps automatic
+	 *  VAD for turn detection but stops user speech from CUTTING the model's
+	 *  in-flight generation — the answer tail is no longer lost server-side;
+	 *  interruption policy becomes fully the caller's (client-side) decision. */
+	activityHandling?: 'START_OF_ACTIVITY_INTERRUPTS' | 'NO_INTERRUPTION';
 }
 
 /** Callbacks fired by GeminiLiveTransport when server messages arrive. */
@@ -211,9 +217,10 @@ export class GeminiLiveTransport implements LLMTransport {
 			};
 		}
 
-		if (this.config.vadConfig) {
+		if (this.config.vadConfig || this.config.activityHandling) {
 			connectConfig.realtimeInputConfig = {
-				automaticActivityDetection: this.config.vadConfig,
+				...(this.config.vadConfig ? { automaticActivityDetection: this.config.vadConfig } : {}),
+				...(this.config.activityHandling ? { activityHandling: this.config.activityHandling } : {}),
 			};
 		}
 
