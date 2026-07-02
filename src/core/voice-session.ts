@@ -65,6 +65,10 @@ export interface VoiceSessionConfig {
 		prefixPaddingMs?: number;
 		silenceDurationMs?: number;
 	};
+	/** Gemini activity handling (realtimeInputConfig.activityHandling).
+	 *  'NO_INTERRUPTION' = user speech no longer cuts in-flight generation
+	 *  server-side; interruption becomes the caller's client-side decision. */
+	activityHandling?: 'START_OF_ACTIVITY_INTERRUPTS' | 'NO_INTERRUPTION';
 	/** Enable server-side transcription of user audio input (default: true).
 	 *  Has no effect when sttProvider is set (built-in is disabled automatically).
 	 *  Use false to disable all input transcription for privacy or cost control. */
@@ -284,6 +288,7 @@ export class VoiceSession {
 					speechConfig: config.speechConfig,
 					compressionConfig: config.compressionConfig,
 					vadConfig: config.vadConfig,
+					activityHandling: config.activityHandling,
 					inputAudioTranscription: inputTranscription,
 				},
 				{},
