@@ -800,9 +800,19 @@ export class VoiceSession {
 			// requiring manual `launchctl kickstart` to recover. Observed live
 			// 2026-05-01: 5+ minutes of stuck RECONNECTING after a transient
 			// ECONNRESET hit while already mid-reconnect.
-			const reconnectPromise = this.transport.reconnect({
-				conversationHistory: this.conversationContext.toReplayContent(),
-			});
+			// Resume vs replay (sutando-meeting#129): when the transport supports
+			// session resumption (Gemini), the stored handle restores the FULL
+			// server-side context — replaying history on top is not just redundant,
+			// it is the re-answer bug: replayHistory() sends the transcript as
+			// realtime INPUT, which the model treats as fresh user speech and
+			// answers again (verbatim repeats + topic regression after every
+			// ~9-min GoAway rotation). Replay only for transports that cannot
+			// resume (OpenAI), where it is the sole recovery mechanism.
+			const reconnectPromise = this.transport.reconnect(
+				this.transport.capabilities.sessionResumption
+					? {}
+					: { conversationHistory: this.conversationContext.toReplayContent() },
+			);
 			let deadlineHandle: ReturnType<typeof setTimeout> | undefined;
 			const deadlinePromise = new Promise<never>((_, reject) => {
 				deadlineHandle = setTimeout(
@@ -842,8 +852,19 @@ export class VoiceSession {
 		}
 	}
 
-	private handleResumptionUpdate(handle: string, _resumable: boolean): void {
-		this.sessionManager.updateResumptionHandle(handle);
+	private handleResumptionUpdate(handle: string, resumable: boolean): void {
+		// Mirror the transport's internal handle state (PR #24 review): a
+		// non-resumable update invalidates the handle on BOTH sides. If the
+		// session manager kept a stale handle here, handleGoAway would enter
+		// the resume path while the transport reconnects fresh WITHOUT replay
+		// — dropping all context. With the handle cleared, handleGoAway skips
+		// the resume path and recovery flows through the CLOSED → fresh
+		// connect branch, which injects condensed history.
+		if (resumable) {
+			this.sessionManager.updateResumptionHandle(handle);
+		} else {
+			this.sessionManager.clearResumptionHandle();
+		}
 	}
 
 	// --- Client transport handlers ---

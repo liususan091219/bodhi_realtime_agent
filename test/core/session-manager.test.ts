@@ -180,6 +180,13 @@ describe('SessionManager', () => {
 			expect(mgr.resumptionHandle).toBe('handle_abc');
 		});
 
+		it('clearResumptionHandle invalidates a stored handle (PR #24 review edge)', () => {
+			const { mgr } = createManager();
+			mgr.updateResumptionHandle('handle_abc');
+			mgr.clearResumptionHandle();
+			expect(mgr.resumptionHandle).toBeNull();
+		});
+
 		it('fires session.resume event', () => {
 			const { mgr, eventBus } = createManager();
 			const handler = vi.fn();

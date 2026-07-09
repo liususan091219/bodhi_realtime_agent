@@ -668,6 +668,18 @@ export class GeminiLiveTransport implements LLMTransport {
 		}
 
 		if (msg.sessionResumptionUpdate?.newHandle) {
+			// Store the handle INTERNALLY so the next connect() actually resumes
+			// (sutando-meeting#129). Pre-fix, only callbacks fired — nothing wrote
+			// config.resumptionHandle, so a GoAway "resume" opened a FRESH session
+			// (sessionResumption: {}) with zero server-side context, and the
+			// conversationHistory replay papered over it (realtime-INPUT replay =
+			// the model re-answers old turns verbatim). Only a resumable handle is
+			// kept: a non-resumable update means the current handle is dead.
+			if (msg.sessionResumptionUpdate.resumable ?? false) {
+				this.config.resumptionHandle = msg.sessionResumptionUpdate.newHandle;
+			} else {
+				this.config.resumptionHandle = undefined;
+			}
 			this.callbacks.onResumptionUpdate?.(
 				msg.sessionResumptionUpdate.newHandle,
 				msg.sessionResumptionUpdate.resumable ?? false,

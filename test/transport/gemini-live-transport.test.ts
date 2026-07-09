@@ -334,6 +334,42 @@ describe('GeminiLiveTransport', () => {
 			expect(onResumptionUpdate).toHaveBeenCalledWith('h_new', true);
 		});
 
+		it('stores a resumable handle and resumes with it on reconnect (sutando-meeting#129)', async () => {
+			const transport = new GeminiLiveTransport({ apiKey: 'test-key' }, {});
+			await transport.connect();
+
+			const cbs = capturedConnectConfig.callbacks as Record<string, (msg: unknown) => void>;
+			cbs.onmessage({
+				sessionResumptionUpdate: { newHandle: 'h_live', resumable: true },
+			});
+
+			mockSession.sendRealtimeInput.mockClear();
+			await transport.reconnect({});
+
+			const config = capturedConnectConfig.config as Record<string, unknown>;
+			expect(config.sessionResumption).toEqual({ handle: 'h_live' });
+			// Resumed session restores server-side context — no history replay.
+			expect(mockSession.sendRealtimeInput).not.toHaveBeenCalled();
+		});
+
+		it('clears the stored handle on a non-resumable update (sutando-meeting#129)', async () => {
+			const transport = new GeminiLiveTransport({ apiKey: 'test-key' }, {});
+			await transport.connect();
+
+			const cbs = capturedConnectConfig.callbacks as Record<string, (msg: unknown) => void>;
+			cbs.onmessage({
+				sessionResumptionUpdate: { newHandle: 'h_live', resumable: true },
+			});
+			cbs.onmessage({
+				sessionResumptionUpdate: { newHandle: 'h_dead', resumable: false },
+			});
+
+			await transport.reconnect({});
+
+			const config = capturedConnectConfig.config as Record<string, unknown>;
+			expect(config.sessionResumption).toEqual({});
+		});
+
 		it('dispatches groundingMetadata', async () => {
 			const onGroundingMetadata = vi.fn();
 			const transport = new GeminiLiveTransport({ apiKey: 'test-key' }, { onGroundingMetadata });

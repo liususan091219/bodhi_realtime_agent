@@ -121,6 +121,17 @@ export class SessionManager {
 		});
 	}
 
+	/** Invalidate the stored handle. A `resumable: false` resumption update
+	 *  means the current handle is dead — keeping it would send handleGoAway
+	 *  down the resume path while the transport (which clears its own copy)
+	 *  opens a fresh session with no replay: silent context loss (PR #24
+	 *  review edge case). Clearing here keeps both copies in sync, so a dead
+	 *  handle routes recovery through the CLOSED → fresh-connect path, which
+	 *  rebuilds condensed context. */
+	clearResumptionHandle(): void {
+		this._resumptionHandle = null;
+	}
+
 	bufferMessage(message: ClientMessage): void {
 		this._bufferedMessages.push(message);
 	}
