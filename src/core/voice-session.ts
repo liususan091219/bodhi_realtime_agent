@@ -8,6 +8,7 @@ import { BehaviorManager } from '../behaviors/behavior-manager.js';
 import { MemoryDistiller } from '../memory/memory-distiller.js';
 import { ToolExecutor } from '../tools/tool-executor.js';
 import { ClientTransport } from '../transport/client-transport.js';
+import { EchoGuard, type EchoGuardConfig } from '../transport/echo-guard.js';
 import { GeminiLiveTransport } from '../transport/gemini-live-transport.js';
 import type { MainAgent, SubagentConfig } from '../types/agent.js';
 import type { BehaviorCategory } from '../types/behavior.js';
@@ -84,6 +85,14 @@ export interface VoiceSessionConfig {
 	};
 	/** Pre-constructed LLM transport. If provided, apiKey/geminiModel/speechConfig/compressionConfig are ignored. */
 	transport?: LLMTransport;
+	/** Acoustic echo suppression at the audio-ingestion chokepoint: inbound audio whose
+	 *  energy envelope correlates with recently PLAYED audio (speakerphone loopback) is
+	 *  dropped before it reaches the model or STT — the root fix for hallucinated
+	 *  "phantom command" transcripts from echo (sutando-meeting#127). OPT-IN: pass
+	 *  `{ enabled: true }` to activate (double-talk on strong-echo paths can drop
+	 *  overlapped user speech — a deliberate per-deployment choice); env
+	 *  BODHI_ECHO_GUARD=0 hard-disables. */
+	echoGuard?: EchoGuardConfig;
 }
 
 /**
@@ -132,6 +141,7 @@ export class VoiceSession {
 	private turnId = 0;
 	private turnFirstAudioAt: number | null = null;
 	private sttProvider?: STTProvider;
+	private echoGuard?: EchoGuard;
 	private _commitFiredForTurn = false;
 	private config: VoiceSessionConfig;
 	private directiveManager = new DirectiveManager();
@@ -247,6 +257,14 @@ export class VoiceSession {
 			);
 			this.log(`Memory distillation enabled (every ${freq} turns)`);
 		}
+
+		// Acoustic echo suppression (sutando-meeting#127) — construct up front so
+		// both audio chokepoints below can consult it. OPT-IN: inert unless the
+		// consumer passes `echoGuard: { enabled: true }` (BODHI_ECHO_GUARD=0 still
+		// hard-disables; see the EchoGuard constructor).
+		this.echoGuard = new EchoGuard({ ...config.echoGuard, log: (msg) => this.log(msg) });
+		if (this.echoGuard.enabled)
+			this.log('EchoGuard enabled (envelope-correlation echo suppression)');
 
 		// Set up LLM transport
 		const initialAgent = config.agents.find((a) => a.name === config.initialAgent);
@@ -563,6 +581,12 @@ export class VoiceSession {
 
 	private handleAudioFromClient(data: Buffer): void {
 		if (this.sessionManager.isActive) {
+			// EchoGuard (sutando-meeting#127): an inbound chunk whose energy envelope
+			// tracks recently PLAYED audio is our own speaker loopback — drop it here
+			// so neither the model nor STT ever hears it (phantom-command root fix).
+			if (this.echoGuard?.check(data, this.transport.audioFormat.inputSampleRate).suppress) {
+				return;
+			}
 			const base64 = data.toString('base64');
 			this.transport.sendAudio(base64);
 			this.sttProvider?.feedAudio(base64);
@@ -575,6 +599,9 @@ export class VoiceSession {
 			this.turnFirstAudioAt = Date.now();
 		}
 		const buffer = Buffer.from(data, 'base64');
+		// EchoGuard reference: remember what we are playing so inbound echo of it
+		// can be recognized (and suppressed) at handleAudioFromClient.
+		this.echoGuard?.feedReference(buffer, this.transport.audioFormat.outputSampleRate);
 		this.clientTransport.sendAudioToClient(buffer);
 	}
 
