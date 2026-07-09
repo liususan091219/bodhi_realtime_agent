@@ -825,8 +825,19 @@ export class VoiceSession {
 		}
 	}
 
-	private handleResumptionUpdate(handle: string, _resumable: boolean): void {
-		this.sessionManager.updateResumptionHandle(handle);
+	private handleResumptionUpdate(handle: string, resumable: boolean): void {
+		// Mirror the transport's internal handle state (PR #24 review): a
+		// non-resumable update invalidates the handle on BOTH sides. If the
+		// session manager kept a stale handle here, handleGoAway would enter
+		// the resume path while the transport reconnects fresh WITHOUT replay
+		// — dropping all context. With the handle cleared, handleGoAway skips
+		// the resume path and recovery flows through the CLOSED → fresh
+		// connect branch, which injects condensed history.
+		if (resumable) {
+			this.sessionManager.updateResumptionHandle(handle);
+		} else {
+			this.sessionManager.clearResumptionHandle();
+		}
 	}
 
 	// --- Client transport handlers ---
