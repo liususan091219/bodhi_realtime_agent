@@ -108,3 +108,15 @@ describe('EchoGuard', () => {
 		expect(res.second).toBe(false);
 	});
 });
+
+describe('EchoGuard opt-in default', () => {
+	it('is disabled unless explicitly enabled', () => {
+		const guard = new EchoGuard(); // no config — must default OFF
+		expect(guard.enabled).toBe(false);
+		const env = randomWalkEnvelope(48);
+		const t0 = 1000000;
+		guard.feedReference(pcmFromEnvelope(env, 24000), 24000, t0);
+		const r = guard.check(pcmFromEnvelope(env.slice(24), 16000), 16000, t0 + 300);
+		expect(r.suppress).toBe(false);
+	});
+});

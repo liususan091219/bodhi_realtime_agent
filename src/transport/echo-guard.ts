@@ -81,7 +81,7 @@ export function bestEnvelopeLag(
 }
 
 export interface EchoGuardConfig {
-	/** Master switch. Default true; env BODHI_ECHO_GUARD=0 hard-disables. */
+	/** Master switch. OPT-IN: default false — set true to activate; env BODHI_ECHO_GUARD=0 hard-disables even then. */
 	enabled?: boolean;
 	/** Correlation at/above which a window counts as echo. Default 0.75. */
 	corrThreshold?: number;
@@ -133,7 +133,11 @@ export class EchoGuard {
 
 	constructor(config?: EchoGuardConfig) {
 		this.cfg = {
-			enabled: config?.enabled !== false && process.env.BODHI_ECHO_GUARD !== '0',
+			// OPT-IN (review decision, PR #23): suppression only runs when the
+			// consumer explicitly enables it — the double-talk cost (overlapped
+			// user speech on strong-echo paths can be dropped with the echo) must
+			// be a deliberate per-deployment choice, not a library default.
+			enabled: config?.enabled === true && process.env.BODHI_ECHO_GUARD !== '0',
 			corrThreshold: config?.corrThreshold ?? 0.75,
 			streakToSuppress: config?.streakToSuppress ?? 2,
 			lagToleranceMs: config?.lagToleranceMs ?? 60,

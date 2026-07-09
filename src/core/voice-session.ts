@@ -88,8 +88,10 @@ export interface VoiceSessionConfig {
 	/** Acoustic echo suppression at the audio-ingestion chokepoint: inbound audio whose
 	 *  energy envelope correlates with recently PLAYED audio (speakerphone loopback) is
 	 *  dropped before it reaches the model or STT — the root fix for hallucinated
-	 *  "phantom command" transcripts from echo (sutando-meeting#127). Enabled by default;
-	 *  pass `{ enabled: false }` or set env BODHI_ECHO_GUARD=0 to disable. */
+	 *  "phantom command" transcripts from echo (sutando-meeting#127). OPT-IN: pass
+	 *  `{ enabled: true }` to activate (double-talk on strong-echo paths can drop
+	 *  overlapped user speech — a deliberate per-deployment choice); env
+	 *  BODHI_ECHO_GUARD=0 hard-disables. */
 	echoGuard?: EchoGuardConfig;
 }
 
