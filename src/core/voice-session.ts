@@ -259,8 +259,9 @@ export class VoiceSession {
 		}
 
 		// Acoustic echo suppression (sutando-meeting#127) — construct up front so
-		// both audio chokepoints below can consult it. Default on; disabled via
-		// config or env inside EchoGuard itself.
+		// both audio chokepoints below can consult it. OPT-IN: inert unless the
+		// consumer passes `echoGuard: { enabled: true }` (BODHI_ECHO_GUARD=0 still
+		// hard-disables; see the EchoGuard constructor).
 		this.echoGuard = new EchoGuard({ ...config.echoGuard, log: (msg) => this.log(msg) });
 		if (this.echoGuard.enabled)
 			this.log('EchoGuard enabled (envelope-correlation echo suppression)');
