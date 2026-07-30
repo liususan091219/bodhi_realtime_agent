@@ -23,7 +23,7 @@ import { HooksManager } from './hooks.js';
 import { InteractionModeManager } from './interaction-mode.js';
 import { MemoryCacheManager } from './memory-cache-manager.js';
 import { SessionManager } from './session-manager.js';
-import { compareTranscripts } from './shadow-stt.js';
+import { compareTranscripts, isSubstantiveDivergence } from './shadow-stt.js';
 import { ToolCallRouter } from './tool-call-router.js';
 import { TranscriptManager } from './transcript-manager.js';
 
@@ -416,7 +416,15 @@ export class VoiceSession {
 					// Option ① self-correction (owner 2026-07-30 "那不还是错"):
 					// only for the CURRENT turn — if the user already moved on to a
 					// newer turn, a late correction would derail the live exchange.
-					if (this.config.divergenceCorrection && turnId !== undefined && turnId === this.turnId) {
+					// Two-tier (owner 2026-07-30 "exact match 不一样就 mute 那 mute 的太多了"):
+					// EVERY divergence is logged above (data); only a MEANING-BEARING one
+					// mutes and corrects — filler/short-artifact diffs stay silent.
+					if (
+						this.config.divergenceCorrection &&
+						turnId !== undefined &&
+						turnId === this.turnId &&
+						isSubstantiveDivergence(live, text)
+					) {
 						this.log(`[ShadowSTT] speaking self-correction for turn ${turnId}`);
 						try {
 							// Owner 2026-07-30 "如果这两个不一样的话你可以把他 mute 掉呀":

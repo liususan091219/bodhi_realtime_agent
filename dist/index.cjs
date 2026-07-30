@@ -3028,6 +3028,54 @@ function compareTranscripts(liveText, shadowText) {
   }
   return { diverged: true, reason: "diverged", normalizedLive: live, normalizedShadow: shadow };
 }
+var FILLERS = /* @__PURE__ */ new Set([
+  "uh",
+  "um",
+  "ah",
+  "oh",
+  "eh",
+  "mm",
+  "hmm",
+  "yeah",
+  "yes",
+  "ok",
+  "okay",
+  "hi",
+  "hey",
+  "hello",
+  "like",
+  "so",
+  "well",
+  "just",
+  "\u5443",
+  "\u55EF",
+  "\u554A",
+  "\u54E6",
+  "\u5C31\u662F",
+  "\u90A3\u4E2A",
+  "\u8FD9\u4E2A",
+  "\u5C31"
+]);
+function isSubstantiveDivergence(liveText, shadowText) {
+  const strip = (s) => normalizeTranscript(s).split(" ").filter((w) => w && !FILLERS.has(w));
+  const a = strip(liveText);
+  const b = strip(shadowText);
+  if (a.join(" ") === b.join(" ")) return false;
+  const countA = /* @__PURE__ */ new Map();
+  for (const w of a) countA.set(w, (countA.get(w) ?? 0) + 1);
+  const countB = /* @__PURE__ */ new Map();
+  for (const w of b) countB.set(w, (countB.get(w) ?? 0) + 1);
+  const diff = [];
+  for (const [w, n] of countA) {
+    const m = countB.get(w) ?? 0;
+    if (n > m) diff.push(w);
+  }
+  for (const [w, n] of countB) {
+    const m = countA.get(w) ?? 0;
+    if (n > m) diff.push(w);
+  }
+  return diff.some((w) => w.length >= 3 || /\d/.test(w));
+}
 
 // src/core/voice-session.ts
 var VoiceSession = class _VoiceSession {
@@ -3237,7 +3285,7 @@ var VoiceSession = class _VoiceSession {
             this.config.onTranscriptionDivergence?.(live, text, turnId);
           } catch {
           }
-          if (this.config.divergenceCorrection && turnId !== void 0 && turnId === this.turnId) {
+          if (this.config.divergenceCorrection && turnId !== void 0 && turnId === this.turnId && isSubstantiveDivergence(live, text)) {
             this.log(`[ShadowSTT] speaking self-correction for turn ${turnId}`);
             try {
               this.clientTransport.sendJsonToClient({ type: "turn.interrupted" });

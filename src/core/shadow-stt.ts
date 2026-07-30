@@ -86,3 +86,74 @@ export function compareTranscripts(liveText: string, shadowText: string): Diverg
 	}
 	return { diverged: true, reason: 'diverged', normalizedLive: live, normalizedShadow: shadow };
 }
+
+/** Filler tokens that carry no meaning — a divergence made ONLY of these must
+ *  not interrupt anyone (owner 2026-07-30 "exact match 不一样就 mute 那 mute 的
+ *  太多了"). Tunable; multilingual on purpose. */
+const FILLERS = new Set([
+	'uh',
+	'um',
+	'ah',
+	'oh',
+	'eh',
+	'mm',
+	'hmm',
+	'yeah',
+	'yes',
+	'ok',
+	'okay',
+	'hi',
+	'hey',
+	'hello',
+	'like',
+	'so',
+	'well',
+	'just',
+	'呃',
+	'嗯',
+	'啊',
+	'哦',
+	'就是',
+	'那个',
+	'这个',
+	'就',
+]);
+
+/**
+ * Is a detected divergence MEANING-BEARING — worth muting the live answer and
+ * speaking a correction? Two-tier design: `compareTranscripts` stays sensitive
+ * (log everything → data), this gate keeps the INTERRUPTION rare:
+ *  - strip filler tokens from both sides;
+ *  - if the filler-stripped sequences are identical → not substantive;
+ *  - otherwise substantive only if the symmetric difference contains at least
+ *    one content-ish token (≥3 chars, or any digit) — a stray short artifact
+ *    ("it", "a", "え") never mutes.
+ * Examples from 2026-07-30 real data: "whats the news"/"whats this" →
+ * substantive (news/this differ, "news" ≥3); "yeah makes sense"/"makes sense"
+ * → filler-only → NO mute; "it can you hear me"/"can you hear me" → "it" <3
+ * chars → NO mute; "alucir can you hear me"/"hi lucy can you hear me" →
+ * substantive (wake-name substitution).
+ */
+export function isSubstantiveDivergence(liveText: string, shadowText: string): boolean {
+	const strip = (s: string): string[] =>
+		normalizeTranscript(s)
+			.split(' ')
+			.filter((w) => w && !FILLERS.has(w));
+	const a = strip(liveText);
+	const b = strip(shadowText);
+	if (a.join(' ') === b.join(' ')) return false;
+	const countA = new Map<string, number>();
+	for (const w of a) countA.set(w, (countA.get(w) ?? 0) + 1);
+	const countB = new Map<string, number>();
+	for (const w of b) countB.set(w, (countB.get(w) ?? 0) + 1);
+	const diff: string[] = [];
+	for (const [w, n] of countA) {
+		const m = countB.get(w) ?? 0;
+		if (n > m) diff.push(w);
+	}
+	for (const [w, n] of countB) {
+		const m = countA.get(w) ?? 0;
+		if (n > m) diff.push(w);
+	}
+	return diff.some((w) => w.length >= 3 || /\d/.test(w));
+}
