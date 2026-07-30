@@ -66,11 +66,23 @@ export function compareTranscripts(liveText: string, shadowText: string): Diverg
 			normalizedLive: live,
 			normalizedShadow: shadow,
 		};
-	// Containment = streaming truncation artifact (the live side often carries
-	// only a prefix/suffix of the utterance), not a mishear — learned from the
-	// 2026-07-30 log-mining pass where 22% of "divergences" were containment.
-	if (live === shadow || live.includes(shadow) || shadow.includes(live)) {
+	if (live === shadow) {
 		return { diverged: false, reason: 'match', normalizedLive: live, normalizedShadow: shadow };
+	}
+	// Containment: only a FRAGMENT (one side much shorter than the other) is a
+	// streaming-truncation artifact, not a mishear — that class was 22% of raw
+	// divergences in the 2026-07-30 log mining. But containment with SIMILAR
+	// lengths is a real edge-word mishear: the owner's own self-test pair
+	// ("what is this" heard when "what is this news" was said — the reverse of
+	// the live incident) is a strict prefix, and blanket containment silently
+	// swallowed it. Fragment iff shorter/longer ≤ 0.6 (truncation example
+	// "what should i" vs "um yeah what should i look at first" = 0.37 → match;
+	// the owner's pair = 0.71 → diverged).
+	if (live.includes(shadow) || shadow.includes(live)) {
+		const ratio = Math.min(live.length, shadow.length) / Math.max(live.length, shadow.length);
+		if (ratio <= 0.6) {
+			return { diverged: false, reason: 'match', normalizedLive: live, normalizedShadow: shadow };
+		}
 	}
 	return { diverged: true, reason: 'diverged', normalizedLive: live, normalizedShadow: shadow };
 }

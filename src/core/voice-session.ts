@@ -520,6 +520,7 @@ export class VoiceSession {
 	/** Start the client WebSocket server and connect to the LLM transport. */
 	async start(): Promise<void> {
 		await this.sttProvider?.start();
+		await this.shadowSttProvider?.start();
 		await this.memoryCacheManager?.refresh();
 
 		// Restore behavior presets from structured directives (deterministic lookup)

@@ -54,6 +54,15 @@ describe('compareTranscripts', () => {
 		}
 	});
 
+	it("the owner's self-test pair: prefix mishear with similar length DIVERGES", () => {
+		// "what is this" heard when "what is this news" was said — strict prefix,
+		// ratio 0.71: a real edge-word mishear that blanket containment swallowed.
+		const r = compareTranscripts('What is this news', 'What is this');
+		expect(r.diverged).toBe(true);
+		// and the symmetric direction
+		expect(compareTranscripts('What is this', 'What is this news').diverged).toBe(true);
+	});
+
 	it('punctuation-only differences are a match (comma vs period harness trap, 07-30)', () => {
 		expect(compareTranscripts('Hello. What’s this?', 'Hello, what’s this?').diverged).toBe(false);
 	});

@@ -3017,8 +3017,14 @@ function compareTranscripts(liveText, shadowText) {
       normalizedLive: live,
       normalizedShadow: shadow
     };
-  if (live === shadow || live.includes(shadow) || shadow.includes(live)) {
+  if (live === shadow) {
     return { diverged: false, reason: "match", normalizedLive: live, normalizedShadow: shadow };
+  }
+  if (live.includes(shadow) || shadow.includes(live)) {
+    const ratio = Math.min(live.length, shadow.length) / Math.max(live.length, shadow.length);
+    if (ratio <= 0.6) {
+      return { diverged: false, reason: "match", normalizedLive: live, normalizedShadow: shadow };
+    }
   }
   return { diverged: true, reason: "diverged", normalizedLive: live, normalizedShadow: shadow };
 }
@@ -3323,6 +3329,7 @@ var VoiceSession = class _VoiceSession {
   /** Start the client WebSocket server and connect to the LLM transport. */
   async start() {
     await this.sttProvider?.start();
+    await this.shadowSttProvider?.start();
     await this.memoryCacheManager?.refresh();
     if (this.config.memory && this.behaviorManager) {
       try {
