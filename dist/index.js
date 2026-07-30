@@ -3158,6 +3158,7 @@ var VoiceSession = class _VoiceSession {
           if (this.config.divergenceCorrection && turnId !== void 0 && turnId === this.turnId) {
             this.log(`[ShadowSTT] speaking self-correction for turn ${turnId}`);
             try {
+              this.clientTransport.sendJsonToClient({ type: "turn.interrupted" });
               this.transport.sendContent(
                 [
                   {

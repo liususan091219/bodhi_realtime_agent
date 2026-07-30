@@ -1849,9 +1849,16 @@ describe('VoiceSession', () => {
 				turnId: number;
 			};
 			const sent = vi.spyOn(internals.transport, 'sendContent').mockImplementation(() => {});
+			const clientTransport = (
+				session as unknown as { clientTransport: { sendJsonToClient: (m: unknown) => void } }
+			).clientTransport;
+			const muted = vi.spyOn(clientTransport, 'sendJsonToClient').mockImplementation(() => {});
 			internals.transport.onInputTranscription?.('What is this news');
 			internals.transport.onModelTurnStart?.();
 			shadow.onTranscript?.('What is this', internals.turnId);
+			// the wrong answer's playback is CUT first (owner: "把他 mute 掉")…
+			expect(muted).toHaveBeenCalledWith({ type: 'turn.interrupted' });
+			// …then exactly one correction turn goes to the model.
 			expect(sent).toHaveBeenCalledTimes(1);
 			const arg = sent.mock.calls[0][0] as Array<{ text: string }>;
 			expect(arg[0].text).toContain('What is this');

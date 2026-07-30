@@ -419,6 +419,14 @@ export class VoiceSession {
 					if (this.config.divergenceCorrection && turnId !== undefined && turnId === this.turnId) {
 						this.log(`[ShadowSTT] speaking self-correction for turn ${turnId}`);
 						try {
+							// Owner 2026-07-30 "如果这两个不一样的话你可以把他 mute 掉呀":
+							// cut the WRONG answer's remaining audio NOW instead of letting
+							// it finish — the client's turn.interrupted handler stops all
+							// active playback sources immediately. The user hears ~1-2s of
+							// the wrong answer (shadow latency floor), then silence, then
+							// the correction. sendContent below also interrupts the model
+							// side, so generation stops too.
+							this.clientTransport.sendJsonToClient({ type: 'turn.interrupted' });
 							this.transport.sendContent(
 								[
 									{
