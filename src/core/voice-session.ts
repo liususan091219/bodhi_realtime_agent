@@ -169,7 +169,7 @@ export class VoiceSession {
 	private _shadowLiveSnapshots = new Map<number, string>();
 	private echoGuard?: EchoGuard;
 	private _commitFiredForTurn = false;
-	private _shadowCommitFiredForTurn = false;
+	private _shadowLastCommittedTurn = -1;
 	private config: VoiceSessionConfig;
 	private directiveManager = new DirectiveManager();
 	private transcriptManager!: TranscriptManager;
@@ -469,8 +469,12 @@ export class VoiceSession {
 				this._commitFiredForTurn = true;
 				this.sttProvider.commit(this.turnId);
 			}
-			if (this.shadowSttProvider && !this._shadowCommitFiredForTurn) {
-				this._shadowCommitFiredForTurn = true;
+			if (this.shadowSttProvider && this._shadowLastCommittedTurn !== this.turnId) {
+				// Per-turnId commit tracking (2026-07-30 live finding: the boolean
+				// latch reset too rarely in the discord flow — 2 compares in a
+				// 33-turn session; the shadow starved). Keying on turnId cannot
+				// starve: each new turn commits exactly once, no reset path needed.
+				this._shadowLastCommittedTurn = this.turnId;
 				// Snapshot the live text for THIS turn before the next one can
 				// start accumulating — the async shadow result pairs by turnId.
 				this._shadowLiveSnapshots.set(this.turnId, this._liveInputThisTurn);

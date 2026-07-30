@@ -1810,7 +1810,6 @@ describe('VoiceSession', () => {
 			const internals = session as unknown as {
 				transport: { onInputTranscription?: (t: string) => void; onModelTurnStart?: () => void };
 				turnId: number;
-				_shadowCommitFiredForTurn: boolean;
 			};
 			internals.transport.onInputTranscription?.('What is this');
 			internals.transport.onModelTurnStart?.();
@@ -1819,8 +1818,7 @@ describe('VoiceSession', () => {
 			// NEXT turn accumulates while the previous shadow result could still be
 			// in flight — the turn-keyed snapshot prevents cross-turn bleed
 			// (qingyun review #25-1: the un-keyed buffer raced exactly here).
-			internals._shadowCommitFiredForTurn = false; // turn-complete reset, as production does
-			internals.turnId += 1;
+			internals.turnId += 1; // per-turnId tracking needs no latch reset
 			internals.transport.onInputTranscription?.('Hello, Lucy');
 			internals.transport.onModelTurnStart?.();
 			shadow.onTranscript?.('Hello, Lucy', internals.turnId);

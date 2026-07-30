@@ -3025,7 +3025,7 @@ var VoiceSession = class _VoiceSession {
   _shadowLiveSnapshots = /* @__PURE__ */ new Map();
   echoGuard;
   _commitFiredForTurn = false;
-  _shadowCommitFiredForTurn = false;
+  _shadowLastCommittedTurn = -1;
   config;
   directiveManager = new DirectiveManager();
   transcriptManager;
@@ -3232,8 +3232,8 @@ var VoiceSession = class _VoiceSession {
         this._commitFiredForTurn = true;
         this.sttProvider.commit(this.turnId);
       }
-      if (this.shadowSttProvider && !this._shadowCommitFiredForTurn) {
-        this._shadowCommitFiredForTurn = true;
+      if (this.shadowSttProvider && this._shadowLastCommittedTurn !== this.turnId) {
+        this._shadowLastCommittedTurn = this.turnId;
         this._shadowLiveSnapshots.set(this.turnId, this._liveInputThisTurn);
         this._liveInputThisTurn = "";
         if (this._shadowLiveSnapshots.size > 8) {
