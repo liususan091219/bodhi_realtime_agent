@@ -45,6 +45,7 @@ __export(index_exports, {
   DEFAULT_SUBAGENT_TIMEOUT_MS: () => DEFAULT_SUBAGENT_TIMEOUT_MS,
   DEFAULT_TOOL_TIMEOUT_MS: () => DEFAULT_TOOL_TIMEOUT_MS,
   DirectiveManager: () => DirectiveManager,
+  EchoGuard: () => EchoGuard,
   ElevenLabsSTTProvider: () => ElevenLabsSTTProvider,
   EventBus: () => EventBus,
   FrameworkError: () => FrameworkError,
@@ -70,8 +71,10 @@ __export(index_exports, {
   TransportError: () => TransportError,
   ValidationError: () => ValidationError,
   VoiceSession: () => VoiceSession,
+  bestEnvelopeLag: () => bestEnvelopeLag,
   createAgentContext: () => createAgentContext,
   createAskUserTool: () => createAskUserTool,
+  envelopePearson: () => envelopePearson,
   runSubagent: () => runSubagent,
   zodToJsonSchema: () => zodToJsonSchema
 });
@@ -1332,6 +1335,16 @@ var SessionManager = class {
       handle
     });
   }
+  /** Invalidate the stored handle. A `resumable: false` resumption update
+   *  means the current handle is dead — keeping it would send handleGoAway
+   *  down the resume path while the transport (which clears its own copy)
+   *  opens a fresh session with no replay: silent context loss (PR #24
+   *  review edge case). Clearing here keeps both copies in sync, so a dead
+   *  handle routes recovery through the CLOSED → fresh-connect path, which
+   *  rebuilds condensed context. */
+  clearResumptionHandle() {
+    this._resumptionHandle = null;
+  }
   bufferMessage(message) {
     this._bufferedMessages.push(message);
   }
@@ -2210,6 +2223,172 @@ var ClientTransport = class {
   }
 };
 
+// src/transport/echo-guard.ts
+function envelopePearson(a, b) {
+  const n = Math.min(a.length, b.length);
+  if (n < 8) return 0;
+  let sa = 0;
+  let sb = 0;
+  for (let i = 0; i < n; i++) {
+    sa += a[i];
+    sb += b[i];
+  }
+  const ma = sa / n;
+  const mb = sb / n;
+  let num = 0;
+  let da = 0;
+  let db = 0;
+  for (let i = 0; i < n; i++) {
+    const xa = a[i] - ma;
+    const xb = b[i] - mb;
+    num += xa * xb;
+    da += xa * xa;
+    db += xb * xb;
+  }
+  const den = Math.sqrt(da * db);
+  return den > 1e-6 ? num / den : 0;
+}
+function bestEnvelopeLag(inputEnv, played, nowMs, winPts, maxLagMs, stepMs) {
+  let best = { corr: 0, lagMs: -1 };
+  if (inputEnv.length < winPts || played.length < winPts) return best;
+  const inp = inputEnv.slice(-winPts);
+  for (let lag = 0; lag <= maxLagMs; lag += stepMs) {
+    const end = nowMs - lag;
+    const start = end - winPts * 20;
+    const ref = [];
+    for (const e of played) {
+      if (e.at >= start && e.at < end) ref.push(e.rms);
+    }
+    if (ref.length < winPts * 0.7) continue;
+    const c = envelopePearson(inp, ref.slice(-winPts));
+    if (c > best.corr) best = { corr: c, lagMs: lag };
+  }
+  return best;
+}
+var FRAME_MS = 20;
+var EchoGuard = class {
+  cfg;
+  log;
+  played = [];
+  inputEnv = [];
+  streak = 0;
+  streakLagMs = -1;
+  lastRefAt = 0;
+  refCarrySamples = 0;
+  // partial-frame carry so short chunks still form frames
+  refCarrySumSq = 0;
+  inCarrySamples = 0;
+  inCarrySumSq = 0;
+  suppressedWindows = 0;
+  constructor(config) {
+    this.cfg = {
+      // OPT-IN (review decision, PR #23): suppression only runs when the
+      // consumer explicitly enables it — the double-talk cost (overlapped
+      // user speech on strong-echo paths can be dropped with the echo) must
+      // be a deliberate per-deployment choice, not a library default.
+      enabled: config?.enabled === true && process.env.BODHI_ECHO_GUARD !== "0",
+      corrThreshold: config?.corrThreshold ?? 0.75,
+      streakToSuppress: config?.streakToSuppress ?? 2,
+      lagToleranceMs: config?.lagToleranceMs ?? 60,
+      maxLagMs: config?.maxLagMs ?? 1500,
+      stepMs: config?.stepMs ?? 20,
+      winPts: config?.winPts ?? 12,
+      refFreshMs: config?.refFreshMs ?? 2e3
+    };
+    this.log = config?.log;
+  }
+  get enabled() {
+    return this.cfg.enabled;
+  }
+  /** Total inbound windows suppressed this session (observability). */
+  get suppressedCount() {
+    return this.suppressedWindows;
+  }
+  /** Feed one outbound (played) PCM chunk — s16le mono at `sampleRate`. */
+  feedReference(pcm, sampleRate, nowMs = Date.now()) {
+    if (!this.cfg.enabled) return;
+    this.lastRefAt = nowMs;
+    const frames = this.pcmToFrames(pcm, sampleRate, true, nowMs);
+    for (const f of frames) this.played.push(f);
+    const cutoff = nowMs - 6e3;
+    if (this.played.length > 512) this.played = this.played.filter((e) => e.at >= cutoff);
+  }
+  /**
+   * Check one inbound (mic) PCM chunk — s16le mono at `sampleRate`.
+   * Returns suppress=true when the chunk correlates with recent playback.
+   */
+  check(pcm, sampleRate, nowMs = Date.now()) {
+    if (!this.cfg.enabled) return { suppress: false, corr: 0, lagMs: -1 };
+    const frames = this.pcmToFrames(pcm, sampleRate, false, nowMs);
+    for (const f of frames) this.inputEnv.push(f.rms);
+    if (this.inputEnv.length > 256) this.inputEnv = this.inputEnv.slice(-256);
+    if (nowMs - this.lastRefAt > this.cfg.refFreshMs) {
+      this.streak = 0;
+      return { suppress: false, corr: 0, lagMs: -1 };
+    }
+    const best = bestEnvelopeLag(
+      this.inputEnv,
+      this.played,
+      nowMs,
+      this.cfg.winPts,
+      this.cfg.maxLagMs,
+      this.cfg.stepMs
+    );
+    if (best.corr >= this.cfg.corrThreshold) {
+      if (this.streak > 0 && Math.abs(best.lagMs - this.streakLagMs) <= this.cfg.lagToleranceMs) {
+        this.streak++;
+      } else {
+        this.streak = 1;
+      }
+      this.streakLagMs = best.lagMs;
+    } else {
+      this.streak = 0;
+      this.streakLagMs = -1;
+    }
+    const suppress = this.streak >= this.cfg.streakToSuppress;
+    if (suppress) {
+      this.suppressedWindows++;
+      if (this.suppressedWindows === 1 || this.suppressedWindows % 50 === 0) {
+        this.log?.(
+          `[EchoGuard] suppressing inbound echo (corr=${best.corr.toFixed(2)} lag=${best.lagMs}ms, total=${this.suppressedWindows})`
+        );
+      }
+    }
+    return { suppress, corr: best.corr, lagMs: best.lagMs };
+  }
+  /** Convert an s16le mono PCM buffer into 20ms RMS envelope frames. */
+  pcmToFrames(pcm, sampleRate, isRef, nowMs) {
+    const samplesPerFrame = Math.max(1, Math.round(sampleRate * FRAME_MS / 1e3));
+    const total = Math.floor(pcm.length / 2);
+    const out = [];
+    let carrySamples = isRef ? this.refCarrySamples : this.inCarrySamples;
+    let carrySumSq = isRef ? this.refCarrySumSq : this.inCarrySumSq;
+    const framesInChunk = Math.ceil((carrySamples + total) / samplesPerFrame);
+    let frameIdx = 0;
+    for (let i = 0; i < total; i++) {
+      const s = pcm.readInt16LE(i * 2) / 32768;
+      carrySumSq += s * s;
+      carrySamples++;
+      if (carrySamples >= samplesPerFrame) {
+        const rms = Math.sqrt(carrySumSq / carrySamples);
+        const at = nowMs - (framesInChunk - 1 - frameIdx) * FRAME_MS;
+        out.push({ rms, at });
+        frameIdx++;
+        carrySamples = 0;
+        carrySumSq = 0;
+      }
+    }
+    if (isRef) {
+      this.refCarrySamples = carrySamples;
+      this.refCarrySumSq = carrySumSq;
+    } else {
+      this.inCarrySamples = carrySamples;
+      this.inCarrySumSq = carrySumSq;
+    }
+    return out;
+  }
+};
+
 // src/transport/gemini-live-transport.ts
 var import_genai = require("@google/genai");
 
@@ -2760,6 +2939,11 @@ var GeminiLiveTransport = class {
       return;
     }
     if (msg.sessionResumptionUpdate?.newHandle) {
+      if (msg.sessionResumptionUpdate.resumable ?? false) {
+        this.config.resumptionHandle = msg.sessionResumptionUpdate.newHandle;
+      } else {
+        this.config.resumptionHandle = void 0;
+      }
       this.callbacks.onResumptionUpdate?.(
         msg.sessionResumptionUpdate.newHandle,
         msg.sessionResumptionUpdate.resumable ?? false
@@ -2805,6 +2989,40 @@ function toolToDeclaration(tool2) {
   };
 }
 
+// src/core/shadow-stt.ts
+function normalizeTranscript(text) {
+  return text.toLowerCase().replace(/[^\p{L}\p{N}\s]/gu, "").replace(/\s+/g, " ").trim();
+}
+function compareTranscripts(liveText, shadowText) {
+  const live = normalizeTranscript(liveText);
+  const shadow = normalizeTranscript(shadowText);
+  if (!live && !shadow)
+    return {
+      diverged: false,
+      reason: "both-empty",
+      normalizedLive: live,
+      normalizedShadow: shadow
+    };
+  if (!live)
+    return {
+      diverged: false,
+      reason: "empty-live",
+      normalizedLive: live,
+      normalizedShadow: shadow
+    };
+  if (!shadow)
+    return {
+      diverged: false,
+      reason: "empty-shadow",
+      normalizedLive: live,
+      normalizedShadow: shadow
+    };
+  if (live === shadow || live.includes(shadow) || shadow.includes(live)) {
+    return { diverged: false, reason: "match", normalizedLive: live, normalizedShadow: shadow };
+  }
+  return { diverged: true, reason: "diverged", normalizedLive: live, normalizedShadow: shadow };
+}
+
 // src/core/voice-session.ts
 var VoiceSession = class _VoiceSession {
   /** Max wait for a reconnect attempt before giving up and transitioning
@@ -2827,7 +3045,11 @@ var VoiceSession = class _VoiceSession {
   turnId = 0;
   turnFirstAudioAt = null;
   sttProvider;
+  shadowSttProvider;
+  _liveInputThisTurn = "";
+  echoGuard;
   _commitFiredForTurn = false;
+  _shadowCommitFiredForTurn = false;
   config;
   directiveManager = new DirectiveManager();
   transcriptManager;
@@ -2919,6 +3141,9 @@ var VoiceSession = class _VoiceSession {
       );
       this.log(`Memory distillation enabled (every ${freq} turns)`);
     }
+    this.echoGuard = new EchoGuard({ ...config.echoGuard, log: (msg) => this.log(msg) });
+    if (this.echoGuard.enabled)
+      this.log("EchoGuard enabled (envelope-correlation echo suppression)");
     const initialAgent = config.agents.find((a) => a.name === config.initialAgent);
     const instructions = initialAgent ? resolveInstructions(initialAgent) : "";
     const behaviorTools = this.behaviorManager?.tools ?? [];
@@ -2977,12 +3202,45 @@ var VoiceSession = class _VoiceSession {
       };
       this.transport.onInputTranscription = void 0;
     } else {
-      this.transport.onInputTranscription = (text) => this.transcriptManager.handleInput(text);
+      this.transport.onInputTranscription = (text) => {
+        if (this.shadowSttProvider) this._liveInputThisTurn += text;
+        this.transcriptManager.handleInput(text);
+      };
+    }
+    if (config.shadowSttProvider && !config.sttProvider) {
+      this.shadowSttProvider = config.shadowSttProvider;
+      this.shadowSttProvider.configure({
+        sampleRate: this.transport.audioFormat.inputSampleRate,
+        bitDepth: this.transport.audioFormat.bitDepth,
+        channels: this.transport.audioFormat.channels
+      });
+      this.shadowSttProvider.onTranscript = (text, turnId) => {
+        const live = this._liveInputThisTurn;
+        this._liveInputThisTurn = "";
+        const r = compareTranscripts(live, text);
+        if (r.diverged) {
+          this.log(
+            `[ShadowSTT] DIVERGENCE turn=${turnId ?? "?"} live="${r.normalizedLive}" shadow="${r.normalizedShadow}"`
+          );
+          try {
+            this.config.onTranscriptionDivergence?.(live, text, turnId);
+          } catch {
+          }
+        }
+      };
+    } else if (config.shadowSttProvider && config.sttProvider) {
+      this.log(
+        "[ShadowSTT] ignored \u2014 sttProvider already replaces built-in transcription (nothing to shadow)"
+      );
     }
     this.transport.onModelTurnStart = () => {
       if (this.sttProvider && !this._commitFiredForTurn) {
         this._commitFiredForTurn = true;
         this.sttProvider.commit(this.turnId);
+      }
+      if (this.shadowSttProvider && !this._shadowCommitFiredForTurn) {
+        this._shadowCommitFiredForTurn = true;
+        this.shadowSttProvider.commit(this.turnId);
       }
     };
     this.clientTransport = new ClientTransport(
@@ -3118,6 +3376,7 @@ var VoiceSession = class _VoiceSession {
       }
     }
     await this.sttProvider?.stop();
+    await this.shadowSttProvider?.stop();
     await this.transport.disconnect();
     await this.clientTransport.stop();
     if (this.sessionManager.state !== "CLOSED") {
@@ -3153,9 +3412,13 @@ var VoiceSession = class _VoiceSession {
   // --- Audio fast-path (no EventBus) ---
   handleAudioFromClient(data) {
     if (this.sessionManager.isActive) {
+      if (this.echoGuard?.check(data, this.transport.audioFormat.inputSampleRate).suppress) {
+        return;
+      }
       const base64 = data.toString("base64");
       this.transport.sendAudio(base64);
       this.sttProvider?.feedAudio(base64);
+      this.shadowSttProvider?.feedAudio(base64);
     }
   }
   handleAudioOutput(data) {
@@ -3164,6 +3427,7 @@ var VoiceSession = class _VoiceSession {
       this.turnFirstAudioAt = Date.now();
     }
     const buffer = Buffer.from(data, "base64");
+    this.echoGuard?.feedReference(buffer, this.transport.audioFormat.outputSampleRate);
     this.clientTransport.sendAudioToClient(buffer);
   }
   // --- Gemini event handlers ---
@@ -3187,6 +3451,7 @@ var VoiceSession = class _VoiceSession {
       }
       this.sttProvider.handleTurnComplete();
       this._commitFiredForTurn = false;
+      this._shadowCommitFiredForTurn = false;
     }
     this.transcriptManager.flush();
     this.turnId++;
@@ -3297,9 +3562,9 @@ ${agent.greeting}` : agent.greeting;
     if (handle) {
       this.sessionManager.transitionTo("RECONNECTING");
       this.clientTransport.startBuffering();
-      const reconnectPromise = this.transport.reconnect({
-        conversationHistory: this.conversationContext.toReplayContent()
-      });
+      const reconnectPromise = this.transport.reconnect(
+        this.transport.capabilities.sessionResumption ? {} : { conversationHistory: this.conversationContext.toReplayContent() }
+      );
       let deadlineHandle;
       const deadlinePromise = new Promise((_, reject) => {
         deadlineHandle = setTimeout(
@@ -3333,8 +3598,12 @@ ${agent.greeting}` : agent.greeting;
       });
     }
   }
-  handleResumptionUpdate(handle, _resumable) {
-    this.sessionManager.updateResumptionHandle(handle);
+  handleResumptionUpdate(handle, resumable) {
+    if (resumable) {
+      this.sessionManager.updateResumptionHandle(handle);
+    } else {
+      this.sessionManager.clearResumptionHandle();
+    }
   }
   // --- Client transport handlers ---
   handleJsonFromClient(message) {
@@ -4463,6 +4732,7 @@ var OpenAIRealtimeTransport = class {
   DEFAULT_SUBAGENT_TIMEOUT_MS,
   DEFAULT_TOOL_TIMEOUT_MS,
   DirectiveManager,
+  EchoGuard,
   ElevenLabsSTTProvider,
   EventBus,
   FrameworkError,
@@ -4488,8 +4758,10 @@ var OpenAIRealtimeTransport = class {
   TransportError,
   ValidationError,
   VoiceSession,
+  bestEnvelopeLag,
   createAgentContext,
   createAskUserTool,
+  envelopePearson,
   runSubagent,
   zodToJsonSchema
 });

@@ -23,6 +23,7 @@ import { HooksManager } from './hooks.js';
 import { InteractionModeManager } from './interaction-mode.js';
 import { MemoryCacheManager } from './memory-cache-manager.js';
 import { SessionManager } from './session-manager.js';
+import { compareTranscripts } from './shadow-stt.js';
 import { ToolCallRouter } from './tool-call-router.js';
 import { TranscriptManager } from './transcript-manager.js';
 
@@ -74,6 +75,18 @@ export interface VoiceSessionConfig {
 	 *  When set, transport built-in transcription is automatically disabled.
 	 *  When omitted, the transport's built-in transcription is used. */
 	sttProvider?: STTProvider;
+	/** SHADOW STT provider — observation-only dual transcription (2026-07-30).
+	 *  Unlike sttProvider, this does NOT replace the transport's built-in
+	 *  transcription: both stay active, the shadow's per-turn transcript is
+	 *  compared against what the model itself heard, and a divergence is
+	 *  logged + surfaced via onTranscriptionDivergence. NOTHING about what the
+	 *  model hears, answers, or stores changes — a Live-model mishear is
+	 *  otherwise self-consistent (transcript and answer agree) and invisible;
+	 *  this is the tell. Omit = zero change. */
+	shadowSttProvider?: STTProvider;
+	/** Called when the shadow STT disagrees with the built-in transcription
+	 *  (normalized compare; containment = streaming truncation, not a mishear). */
+	onTranscriptionDivergence?: (liveText: string, shadowText: string, turnId?: number) => void;
 	/** Behavior categories for dynamic runtime tuning (speech speed, verbosity, etc.). */
 	behaviors?: BehaviorCategory[];
 	/** Enable memory distillation. Extracts durable user facts from conversation and persists them. */
@@ -141,8 +154,11 @@ export class VoiceSession {
 	private turnId = 0;
 	private turnFirstAudioAt: number | null = null;
 	private sttProvider?: STTProvider;
+	private shadowSttProvider?: STTProvider;
+	private _liveInputThisTurn = '';
 	private echoGuard?: EchoGuard;
 	private _commitFiredForTurn = false;
+	private _shadowCommitFiredForTurn = false;
 	private config: VoiceSessionConfig;
 	private directiveManager = new DirectiveManager();
 	private transcriptManager!: TranscriptManager;
@@ -352,7 +368,42 @@ export class VoiceSession {
 			this.transport.onInputTranscription = undefined;
 		} else {
 			// No external STT — use transport built-in transcription
-			this.transport.onInputTranscription = (text) => this.transcriptManager.handleInput(text);
+			this.transport.onInputTranscription = (text) => {
+				if (this.shadowSttProvider) this._liveInputThisTurn += text;
+				this.transcriptManager.handleInput(text);
+			};
+		}
+
+		// Shadow STT (observation-only): feed the same audio to a second
+		// transcriber and compare per turn. Built-in transcription stays the
+		// one and only source for transcriptManager — the shadow NEVER feeds
+		// handleInput (that would double every user turn); it only compares.
+		if (config.shadowSttProvider && !config.sttProvider) {
+			this.shadowSttProvider = config.shadowSttProvider;
+			this.shadowSttProvider.configure({
+				sampleRate: this.transport.audioFormat.inputSampleRate,
+				bitDepth: this.transport.audioFormat.bitDepth,
+				channels: this.transport.audioFormat.channels,
+			});
+			this.shadowSttProvider.onTranscript = (text, turnId) => {
+				const live = this._liveInputThisTurn;
+				this._liveInputThisTurn = '';
+				const r = compareTranscripts(live, text);
+				if (r.diverged) {
+					this.log(
+						`[ShadowSTT] DIVERGENCE turn=${turnId ?? '?'} live="${r.normalizedLive}" shadow="${r.normalizedShadow}"`,
+					);
+					try {
+						this.config.onTranscriptionDivergence?.(live, text, turnId);
+					} catch {
+						/* observer must never break the session */
+					}
+				}
+			};
+		} else if (config.shadowSttProvider && config.sttProvider) {
+			this.log(
+				'[ShadowSTT] ignored — sttProvider already replaces built-in transcription (nothing to shadow)',
+			);
 		}
 
 		// Wire onModelTurnStart for STT commit trigger
@@ -360,6 +411,10 @@ export class VoiceSession {
 			if (this.sttProvider && !this._commitFiredForTurn) {
 				this._commitFiredForTurn = true;
 				this.sttProvider.commit(this.turnId);
+			}
+			if (this.shadowSttProvider && !this._shadowCommitFiredForTurn) {
+				this._shadowCommitFiredForTurn = true;
+				this.shadowSttProvider.commit(this.turnId);
 			}
 		};
 
@@ -534,6 +589,7 @@ export class VoiceSession {
 		}
 
 		await this.sttProvider?.stop();
+		await this.shadowSttProvider?.stop();
 		await this.transport.disconnect();
 		await this.clientTransport.stop();
 
@@ -590,6 +646,7 @@ export class VoiceSession {
 			const base64 = data.toString('base64');
 			this.transport.sendAudio(base64);
 			this.sttProvider?.feedAudio(base64);
+			this.shadowSttProvider?.feedAudio(base64);
 		}
 	}
 
@@ -638,6 +695,7 @@ export class VoiceSession {
 			}
 			this.sttProvider.handleTurnComplete();
 			this._commitFiredForTurn = false;
+			this._shadowCommitFiredForTurn = false;
 		}
 
 		this.transcriptManager.flush();

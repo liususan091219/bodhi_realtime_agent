@@ -983,6 +983,14 @@ declare class SessionManager {
     reset(): void;
     transitionTo(newState: SessionState): void;
     updateResumptionHandle(handle: string): void;
+    /** Invalidate the stored handle. A `resumable: false` resumption update
+     *  means the current handle is dead — keeping it would send handleGoAway
+     *  down the resume path while the transport (which clears its own copy)
+     *  opens a fresh session with no replay: silent context loss (PR #24
+     *  review edge case). Clearing here keeps both copies in sync, so a dead
+     *  handle routes recovery through the CLOSED → fresh-connect path, which
+     *  rebuilds condensed context. */
+    clearResumptionHandle(): void;
     bufferMessage(message: ClientMessage): void;
     drainBufferedMessages(): ClientMessage[];
 }
@@ -1757,6 +1765,79 @@ declare class ToolCallRouter {
     private handleBackgroundToolCall;
 }
 
+/** One 20ms energy sample of played (reference) audio. */
+type EchoEnvEntry = {
+    rms: number;
+    at: number;
+};
+/** Pearson correlation of two equal-length envelopes (0 when degenerate). */
+declare function envelopePearson(a: number[], b: number[]): number;
+/** Best (corr, lagMs) of the input envelope vs the played-envelope ring over 0..maxLagMs. */
+declare function bestEnvelopeLag(inputEnv: number[], played: EchoEnvEntry[], nowMs: number, winPts: number, maxLagMs: number, stepMs: number): {
+    corr: number;
+    lagMs: number;
+};
+interface EchoGuardConfig {
+    /** Master switch. OPT-IN: default false — set true to activate; env BODHI_ECHO_GUARD=0 hard-disables even then. */
+    enabled?: boolean;
+    /** Correlation at/above which a window counts as echo. Default 0.75. */
+    corrThreshold?: number;
+    /** Consecutive echo windows required before suppression starts. Default 2. */
+    streakToSuppress?: number;
+    /** Max lag drift (ms) between consecutive windows for the streak to continue.
+     *  Real echo sits at a stable lag; spurious correlation peaks wander. Default 60. */
+    lagToleranceMs?: number;
+    /** Max playback→mic lag searched, ms. Default 1500. */
+    maxLagMs?: number;
+    /** Lag search step, ms. Default 20 (one envelope frame). */
+    stepMs?: number;
+    /** Correlation window length in 20ms points. Default 12 (240ms). */
+    winPts?: number;
+    /** How long the reference stays fresh after playback stops, ms. Default 2000. */
+    refFreshMs?: number;
+    /** Log callback for suppression events. */
+    log?: (msg: string) => void;
+}
+interface EchoCheckResult {
+    suppress: boolean;
+    corr: number;
+    lagMs: number;
+}
+/**
+ * Per-session echo suppressor. Feed every OUTBOUND audio chunk through
+ * {@link feedReference} and run every INBOUND chunk through {@link check};
+ * a `suppress: true` result means the inbound chunk is (part of) the
+ * assistant's own playback echoed back and should not be forwarded to the
+ * model or STT.
+ */
+declare class EchoGuard {
+    private readonly cfg;
+    private readonly log?;
+    private played;
+    private inputEnv;
+    private streak;
+    private streakLagMs;
+    private lastRefAt;
+    private refCarrySamples;
+    private refCarrySumSq;
+    private inCarrySamples;
+    private inCarrySumSq;
+    private suppressedWindows;
+    constructor(config?: EchoGuardConfig);
+    get enabled(): boolean;
+    /** Total inbound windows suppressed this session (observability). */
+    get suppressedCount(): number;
+    /** Feed one outbound (played) PCM chunk — s16le mono at `sampleRate`. */
+    feedReference(pcm: Buffer, sampleRate: number, nowMs?: number): void;
+    /**
+     * Check one inbound (mic) PCM chunk — s16le mono at `sampleRate`.
+     * Returns suppress=true when the chunk correlates with recent playback.
+     */
+    check(pcm: Buffer, sampleRate: number, nowMs?: number): EchoCheckResult;
+    /** Convert an s16le mono PCM buffer into 20ms RMS envelope frames. */
+    private pcmToFrames;
+}
+
 /** A single preset within a behavior category. */
 interface BehaviorPreset {
     /** Machine-readable preset name (enum value in tool schema). */
@@ -1833,6 +1914,18 @@ interface VoiceSessionConfig {
      *  When set, transport built-in transcription is automatically disabled.
      *  When omitted, the transport's built-in transcription is used. */
     sttProvider?: STTProvider;
+    /** SHADOW STT provider — observation-only dual transcription (2026-07-30).
+     *  Unlike sttProvider, this does NOT replace the transport's built-in
+     *  transcription: both stay active, the shadow's per-turn transcript is
+     *  compared against what the model itself heard, and a divergence is
+     *  logged + surfaced via onTranscriptionDivergence. NOTHING about what the
+     *  model hears, answers, or stores changes — a Live-model mishear is
+     *  otherwise self-consistent (transcript and answer agree) and invisible;
+     *  this is the tell. Omit = zero change. */
+    shadowSttProvider?: STTProvider;
+    /** Called when the shadow STT disagrees with the built-in transcription
+     *  (normalized compare; containment = streaming truncation, not a mishear). */
+    onTranscriptionDivergence?: (liveText: string, shadowText: string, turnId?: number) => void;
     /** Behavior categories for dynamic runtime tuning (speech speed, verbosity, etc.). */
     behaviors?: BehaviorCategory[];
     /** Enable memory distillation. Extracts durable user facts from conversation and persists them. */
@@ -1844,6 +1937,14 @@ interface VoiceSessionConfig {
     };
     /** Pre-constructed LLM transport. If provided, apiKey/geminiModel/speechConfig/compressionConfig are ignored. */
     transport?: LLMTransport;
+    /** Acoustic echo suppression at the audio-ingestion chokepoint: inbound audio whose
+     *  energy envelope correlates with recently PLAYED audio (speakerphone loopback) is
+     *  dropped before it reaches the model or STT — the root fix for hallucinated
+     *  "phantom command" transcripts from echo (sutando-meeting#127). OPT-IN: pass
+     *  `{ enabled: true }` to activate (double-talk on strong-echo paths can drop
+     *  overlapped user speech — a deliberate per-deployment choice); env
+     *  BODHI_ECHO_GUARD=0 hard-disables. */
+    echoGuard?: EchoGuardConfig;
 }
 /**
  * Top-level integration hub that wires all framework components together.
@@ -1890,7 +1991,11 @@ declare class VoiceSession {
     private turnId;
     private turnFirstAudioAt;
     private sttProvider?;
+    private shadowSttProvider?;
+    private _liveInputThisTurn;
+    private echoGuard?;
     private _commitFiredForTurn;
+    private _shadowCommitFiredForTurn;
     private config;
     private directiveManager;
     private transcriptManager;
@@ -2459,4 +2564,4 @@ interface QueuedNotification {
     queuedAt: number;
 }
 
-export { AUDIO_FORMAT, type AgentContext, AgentError, AgentRouter, AudioBuffer, type AudioFormat, type AudioFormatSpec, BackgroundNotificationQueue, type BehaviorCategory, type BehaviorPreset, CancelledError, type ClientMessage, ClientTransport, type ClientTransportCallbacks, type ContentTurn, ConversationContext, type ConversationHistoryStore, ConversationHistoryWriter, type ConversationItem, type ConversationItemRole, DEFAULT_CONNECT_TIMEOUT_MS, DEFAULT_EXTRACTION_TIMEOUT_MS, DEFAULT_RECONNECT_TIMEOUT_MS, DEFAULT_SUBAGENT_TIMEOUT_MS, DEFAULT_TOOL_TIMEOUT_MS, DirectiveManager, type ElevenLabsSTTConfig, ElevenLabsSTTProvider, type ErrorSeverity, EventBus, type EventHandler, type EventPayload, type EventPayloadMap, type EventSourceConfig, type EventType, type ExternalEvent, FrameworkError, type FrameworkHooks, type GeminiBatchSTTConfig, GeminiBatchSTTProvider, GeminiLiveTransport, type GeminiTransportCallbacks, type GeminiTransportConfig, HooksManager, type IEventBus, InMemorySessionStore, InputTimeoutError, InteractionModeManager, type InteractiveSubagentConfig, JsonMemoryStore, type LLMTransport, type LLMTransportConfig, type LLMTransportError, type MainAgent, MemoryCacheManager, type MemoryCategory, MemoryDistiller, type MemoryDistillerConfig, MemoryError, type MemoryFact, type MemoryStore, type NotificationPriority, type OpenAIRealtimeConfig, OpenAIRealtimeTransport, type PaginationOptions, type PendingToolCall, type QueuedNotification, type ReconnectState, type ReplayItem, type ResumptionState, type ResumptionUpdate, type RunSubagentOptions, type STTAudioConfig, type STTProvider, type SendOrQueueOptions, type ServiceSubagentConfig, type SessionAnalytics, type SessionCheckpoint, SessionCompletedError, type SessionConfig, SessionError, type SessionInteractionMode, SessionManager, type SessionRecord, type SessionReport, type SessionState, type SessionStore, type SessionSummary, type SessionUpdate, type SubagentConfig, type SubagentContextSnapshot, type SubagentEventCallbacks, type SubagentMessage, type SubagentResult, type SubagentSession, SubagentSessionImpl, type SubagentSessionState, type SubagentTask, type ToolCall, ToolCallRouter, type ToolCallRouterDeps, type ToolContext, type ToolDefinition, type ToolExecution, ToolExecutionError, ToolExecutor, type ToolResult, TranscriptManager, type TranscriptSink, type TransportAuth, type TransportCapabilities, TransportError, type TransportPendingToolCall, type TransportToolCall, type TransportToolResult, type UIPayload, type UIResponse, type Unsubscribe, ValidationError, VoiceSession, type VoiceSessionConfig, createAgentContext, createAskUserTool, runSubagent, zodToJsonSchema };
+export { AUDIO_FORMAT, type AgentContext, AgentError, AgentRouter, AudioBuffer, type AudioFormat, type AudioFormatSpec, BackgroundNotificationQueue, type BehaviorCategory, type BehaviorPreset, CancelledError, type ClientMessage, ClientTransport, type ClientTransportCallbacks, type ContentTurn, ConversationContext, type ConversationHistoryStore, ConversationHistoryWriter, type ConversationItem, type ConversationItemRole, DEFAULT_CONNECT_TIMEOUT_MS, DEFAULT_EXTRACTION_TIMEOUT_MS, DEFAULT_RECONNECT_TIMEOUT_MS, DEFAULT_SUBAGENT_TIMEOUT_MS, DEFAULT_TOOL_TIMEOUT_MS, DirectiveManager, type EchoCheckResult, type EchoEnvEntry, EchoGuard, type EchoGuardConfig, type ElevenLabsSTTConfig, ElevenLabsSTTProvider, type ErrorSeverity, EventBus, type EventHandler, type EventPayload, type EventPayloadMap, type EventSourceConfig, type EventType, type ExternalEvent, FrameworkError, type FrameworkHooks, type GeminiBatchSTTConfig, GeminiBatchSTTProvider, GeminiLiveTransport, type GeminiTransportCallbacks, type GeminiTransportConfig, HooksManager, type IEventBus, InMemorySessionStore, InputTimeoutError, InteractionModeManager, type InteractiveSubagentConfig, JsonMemoryStore, type LLMTransport, type LLMTransportConfig, type LLMTransportError, type MainAgent, MemoryCacheManager, type MemoryCategory, MemoryDistiller, type MemoryDistillerConfig, MemoryError, type MemoryFact, type MemoryStore, type NotificationPriority, type OpenAIRealtimeConfig, OpenAIRealtimeTransport, type PaginationOptions, type PendingToolCall, type QueuedNotification, type ReconnectState, type ReplayItem, type ResumptionState, type ResumptionUpdate, type RunSubagentOptions, type STTAudioConfig, type STTProvider, type SendOrQueueOptions, type ServiceSubagentConfig, type SessionAnalytics, type SessionCheckpoint, SessionCompletedError, type SessionConfig, SessionError, type SessionInteractionMode, SessionManager, type SessionRecord, type SessionReport, type SessionState, type SessionStore, type SessionSummary, type SessionUpdate, type SubagentConfig, type SubagentContextSnapshot, type SubagentEventCallbacks, type SubagentMessage, type SubagentResult, type SubagentSession, SubagentSessionImpl, type SubagentSessionState, type SubagentTask, type ToolCall, ToolCallRouter, type ToolCallRouterDeps, type ToolContext, type ToolDefinition, type ToolExecution, ToolExecutionError, ToolExecutor, type ToolResult, TranscriptManager, type TranscriptSink, type TransportAuth, type TransportCapabilities, TransportError, type TransportPendingToolCall, type TransportToolCall, type TransportToolResult, type UIPayload, type UIResponse, type Unsubscribe, ValidationError, VoiceSession, type VoiceSessionConfig, bestEnvelopeLag, createAgentContext, createAskUserTool, envelopePearson, runSubagent, zodToJsonSchema };
