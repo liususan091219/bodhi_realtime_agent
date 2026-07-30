@@ -87,6 +87,13 @@ export interface VoiceSessionConfig {
 	/** Called when the shadow STT disagrees with the built-in transcription
 	 *  (normalized compare; containment = streaming truncation, not a mishear). */
 	onTranscriptionDivergence?: (liveText: string, shadowText: string, turnId?: number) => void;
+	/** With shadowSttProvider set: on divergence, SPEAK a self-correction — the
+	 *  model is told what the user actually said and answers the real question
+	 *  ("说错自纠", owner-selected option ① 2026-07-30). The shadow result
+	 *  arrives 1-3s behind live speech, so the wrong first answer still starts
+	 *  playing; this interrupts it with the correction. Stale results (a newer
+	 *  turn already started) never fire. Default OFF — observation only. */
+	divergenceCorrection?: boolean;
 	/** Behavior categories for dynamic runtime tuning (speech speed, verbosity, etc.). */
 	behaviors?: BehaviorCategory[];
 	/** Enable memory distillation. Extracts durable user facts from conversation and persists them. */
@@ -405,6 +412,28 @@ export class VoiceSession {
 						this.config.onTranscriptionDivergence?.(live, text, turnId);
 					} catch {
 						/* observer must never break the session */
+					}
+					// Option ① self-correction (owner 2026-07-30 "那不还是错"):
+					// only for the CURRENT turn — if the user already moved on to a
+					// newer turn, a late correction would derail the live exchange.
+					if (this.config.divergenceCorrection && turnId !== undefined && turnId === this.turnId) {
+						this.log(`[ShadowSTT] speaking self-correction for turn ${turnId}`);
+						try {
+							this.transport.sendContent(
+								[
+									{
+										role: 'user',
+										text:
+											`[TRANSCRIPTION CORRECTION — not the user speaking] A second transcription shows the user actually said: "${text}". ` +
+											`You answered a mishearing ("${live}"). In ONE short sentence acknowledge the correction ` +
+											`(e.g. "sorry — you asked about …"), then answer the user's ACTUAL question. Do not repeat the wrong answer.`,
+									},
+								],
+								true,
+							);
+						} catch {
+							/* transport hiccup must never break the session; the divergence is already logged */
+						}
 					}
 				}
 			};

@@ -1827,6 +1827,67 @@ describe('VoiceSession', () => {
 			expect(divergences).toHaveLength(0);
 		});
 
+		it('divergenceCorrection ON: current-turn divergence speaks a correction carrying the shadow text', () => {
+			const shadow = createMockShadow();
+			session = new VoiceSession({
+				sessionId: 'sess_corr',
+				userId: 'user_1',
+				apiKey: 'test-key',
+				agents: [createEchoAgent()],
+				initialAgent: 'echo',
+				port: 9925,
+				model: mockModel,
+				shadowSttProvider: shadow,
+				divergenceCorrection: true,
+			});
+			const internals = session as unknown as {
+				transport: {
+					onInputTranscription?: (t: string) => void;
+					onModelTurnStart?: () => void;
+					sendContent: (turns: unknown[], done: boolean) => void;
+				};
+				turnId: number;
+			};
+			const sent = vi.spyOn(internals.transport, 'sendContent').mockImplementation(() => {});
+			internals.transport.onInputTranscription?.('What is this news');
+			internals.transport.onModelTurnStart?.();
+			shadow.onTranscript?.('What is this', internals.turnId);
+			expect(sent).toHaveBeenCalledTimes(1);
+			const arg = sent.mock.calls[0][0] as Array<{ text: string }>;
+			expect(arg[0].text).toContain('What is this');
+			expect(arg[0].text).toContain('TRANSCRIPTION CORRECTION');
+		});
+
+		it('divergenceCorrection: stale turn never fires; flag OFF never fires', () => {
+			const shadow = createMockShadow();
+			session = new VoiceSession({
+				sessionId: 'sess_corr2',
+				userId: 'user_1',
+				apiKey: 'test-key',
+				agents: [createEchoAgent()],
+				initialAgent: 'echo',
+				port: 9926,
+				model: mockModel,
+				shadowSttProvider: shadow,
+				divergenceCorrection: true,
+			});
+			const internals = session as unknown as {
+				transport: {
+					onInputTranscription?: (t: string) => void;
+					onModelTurnStart?: () => void;
+					sendContent: (turns: unknown[], done: boolean) => void;
+				};
+				turnId: number;
+			};
+			const sent = vi.spyOn(internals.transport, 'sendContent').mockImplementation(() => {});
+			internals.transport.onInputTranscription?.('What is this news');
+			internals.transport.onModelTurnStart?.();
+			const staleTurn = internals.turnId;
+			internals.turnId = staleTurn + 1; // conversation moved on before the shadow result landed
+			shadow.onTranscript?.('What is this', staleTurn);
+			expect(sent).not.toHaveBeenCalled(); // diverged, logged — but stale: no spoken correction
+		});
+
 		it('feedAudio + stop lifecycle mirror sttProvider; ignored when exclusive sttProvider present', async () => {
 			const shadow = createMockShadow();
 			session = new VoiceSession({

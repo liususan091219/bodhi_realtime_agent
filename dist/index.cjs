@@ -3237,6 +3237,21 @@ var VoiceSession = class _VoiceSession {
             this.config.onTranscriptionDivergence?.(live, text, turnId);
           } catch {
           }
+          if (this.config.divergenceCorrection && turnId !== void 0 && turnId === this.turnId) {
+            this.log(`[ShadowSTT] speaking self-correction for turn ${turnId}`);
+            try {
+              this.transport.sendContent(
+                [
+                  {
+                    role: "user",
+                    text: `[TRANSCRIPTION CORRECTION \u2014 not the user speaking] A second transcription shows the user actually said: "${text}". You answered a mishearing ("${live}"). In ONE short sentence acknowledge the correction (e.g. "sorry \u2014 you asked about \u2026"), then answer the user's ACTUAL question. Do not repeat the wrong answer.`
+                  }
+                ],
+                true
+              );
+            } catch {
+            }
+          }
         }
       };
     } else if (config.shadowSttProvider && config.sttProvider) {

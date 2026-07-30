@@ -1926,6 +1926,13 @@ interface VoiceSessionConfig {
     /** Called when the shadow STT disagrees with the built-in transcription
      *  (normalized compare; containment = streaming truncation, not a mishear). */
     onTranscriptionDivergence?: (liveText: string, shadowText: string, turnId?: number) => void;
+    /** With shadowSttProvider set: on divergence, SPEAK a self-correction — the
+     *  model is told what the user actually said and answers the real question
+     *  ("说错自纠", owner-selected option ① 2026-07-30). The shadow result
+     *  arrives 1-3s behind live speech, so the wrong first answer still starts
+     *  playing; this interrupts it with the correction. Stale results (a newer
+     *  turn already started) never fire. Default OFF — observation only. */
+    divergenceCorrection?: boolean;
     /** Behavior categories for dynamic runtime tuning (speech speed, verbosity, etc.). */
     behaviors?: BehaviorCategory[];
     /** Enable memory distillation. Extracts durable user facts from conversation and persists them. */
