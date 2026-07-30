@@ -765,7 +765,6 @@ export class VoiceSession {
 			}
 			this.sttProvider.handleTurnComplete();
 			this._commitFiredForTurn = false;
-			this._shadowCommitFiredForTurn = false;
 		}
 
 		this.transcriptManager.flush();

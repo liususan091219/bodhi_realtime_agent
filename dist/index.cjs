@@ -3534,7 +3534,6 @@ var VoiceSession = class _VoiceSession {
       }
       this.sttProvider.handleTurnComplete();
       this._commitFiredForTurn = false;
-      this._shadowCommitFiredForTurn = false;
     }
     this.transcriptManager.flush();
     this.turnId++;
