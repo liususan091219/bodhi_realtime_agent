@@ -3195,6 +3195,7 @@ var VoiceSession = class _VoiceSession {
         if (turnId !== void 0) this._shadowLiveSnapshots.delete(turnId);
         else this._liveInputThisTurn = "";
         const r = compareTranscripts(live, text);
+        this.log(`[ShadowSTT] turn ${turnId ?? "?"} compared: ${r.reason}`);
         if (r.diverged) {
           this.log(
             `[ShadowSTT] DIVERGENCE turn=${turnId ?? "?"} live="${r.normalizedLive}" shadow="${r.normalizedShadow}"`

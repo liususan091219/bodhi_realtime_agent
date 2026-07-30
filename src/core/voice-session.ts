@@ -404,6 +404,10 @@ export class VoiceSession {
 				if (turnId !== undefined) this._shadowLiveSnapshots.delete(turnId);
 				else this._liveInputThisTurn = '';
 				const r = compareTranscripts(live, text);
+				// Heartbeat at every compare (not just divergences) — without this a
+				// clean session is indistinguishable from a dead shadow (found while
+				// preparing the owner's live test 2026-07-30).
+				this.log(`[ShadowSTT] turn ${turnId ?? '?'} compared: ${r.reason}`);
 				if (r.diverged) {
 					this.log(
 						`[ShadowSTT] DIVERGENCE turn=${turnId ?? '?'} live="${r.normalizedLive}" shadow="${r.normalizedShadow}"`,
