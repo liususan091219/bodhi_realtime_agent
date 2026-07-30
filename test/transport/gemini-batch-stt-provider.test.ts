@@ -273,3 +273,44 @@ describe('GeminiBatchSTTProvider', () => {
 		});
 	});
 });
+
+describe('contextHint (deck vocabulary bias)', () => {
+	it('base prompt without a hint is unchanged', () => {
+		const p = new GeminiBatchSTTProvider({ apiKey: 'k', model: 'm' });
+		expect(p.buildPrompt()).toBe(
+			'Transcribe the spoken words in this audio. If the audio contains only silence, background noise, or no clear speech, respond with exactly: [SILENCE]',
+		);
+	});
+
+	it('static hint is embedded with prefer-exact-spelling instruction', () => {
+		const p = new GeminiBatchSTTProvider({
+			apiKey: 'k',
+			model: 'm',
+			contextHint: 'KDA, math derivation, delta rule',
+		});
+		const prompt = p.buildPrompt();
+		expect(prompt).toContain('math derivation');
+		expect(prompt).toContain('exact spelling');
+		expect(prompt).toContain('Do NOT force a match');
+	});
+
+	it('function hint is re-read per call — deck can load after construction', () => {
+		const holder: { deck?: string } = {};
+		const p = new GeminiBatchSTTProvider({
+			apiKey: 'k',
+			model: 'm',
+			contextHint: () => holder.deck,
+		});
+		expect(p.buildPrompt()).not.toContain('likely to occur');
+		holder.deck = 'MoonViT, LatentMoE';
+		expect(p.buildPrompt()).toContain('MoonViT');
+	});
+
+	it('setContextHint replaces the hint; empty/whitespace hint falls back to base', () => {
+		const p = new GeminiBatchSTTProvider({ apiKey: 'k', model: 'm', contextHint: 'KDA' });
+		p.setContextHint('   ');
+		expect(p.buildPrompt()).not.toContain('likely to occur');
+		p.setContextHint('RoPE, NoPE');
+		expect(p.buildPrompt()).toContain('NoPE');
+	});
+});
