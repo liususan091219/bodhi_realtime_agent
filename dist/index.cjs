@@ -3061,19 +3061,11 @@ function isSubstantiveDivergence(liveText, shadowText) {
   const a = strip(liveText);
   const b = strip(shadowText);
   if (a.join(" ") === b.join(" ")) return false;
-  const countA = /* @__PURE__ */ new Map();
-  for (const w of a) countA.set(w, (countA.get(w) ?? 0) + 1);
-  const countB = /* @__PURE__ */ new Map();
-  for (const w of b) countB.set(w, (countB.get(w) ?? 0) + 1);
+  const setA = new Set(a);
+  const setB = new Set(b);
   const diff = [];
-  for (const [w, n] of countA) {
-    const m = countB.get(w) ?? 0;
-    if (n > m) diff.push(w);
-  }
-  for (const [w, n] of countB) {
-    const m = countA.get(w) ?? 0;
-    if (n > m) diff.push(w);
-  }
+  for (const w of setA) if (!setB.has(w)) diff.push(w);
+  for (const w of setB) if (!setA.has(w)) diff.push(w);
   return diff.some((w) => w.length >= 3 || /\d/.test(w));
 }
 
