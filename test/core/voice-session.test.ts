@@ -1779,13 +1779,16 @@ describe('VoiceSession', () => {
 				onTranscriptionDivergence: (live, sh) => divergences.push({ live, shadow: sh }),
 			});
 			// Drive the REAL wiring: built-in transcription accumulates…
-			const transport = (
-				session as unknown as { transport: { onInputTranscription?: (t: string) => void } }
-			).transport;
-			transport.onInputTranscription?.('What is ');
-			transport.onInputTranscription?.('this news');
-			// …then the shadow's transcript for the turn arrives.
-			shadow.onTranscript?.('What is this', 1);
+			const internals = session as unknown as {
+				transport: { onInputTranscription?: (t: string) => void; onModelTurnStart?: () => void };
+				turnId: number;
+			};
+			internals.transport.onInputTranscription?.('What is ');
+			internals.transport.onInputTranscription?.('this news');
+			// …the turn commits (snapshot keyed by turnId)…
+			internals.transport.onModelTurnStart?.();
+			// …then the shadow's ASYNC transcript for that turn arrives.
+			shadow.onTranscript?.('What is this', internals.turnId);
 			expect(divergences).toHaveLength(1);
 			expect(divergences[0]).toEqual({ live: 'What is this news', shadow: 'What is this' });
 		});
@@ -1804,15 +1807,23 @@ describe('VoiceSession', () => {
 				shadowSttProvider: shadow,
 				onTranscriptionDivergence: (live) => divergences.push(live),
 			});
-			const transport = (
-				session as unknown as { transport: { onInputTranscription?: (t: string) => void } }
-			).transport;
-			transport.onInputTranscription?.('What is this');
-			shadow.onTranscript?.('What is this', 1);
+			const internals = session as unknown as {
+				transport: { onInputTranscription?: (t: string) => void; onModelTurnStart?: () => void };
+				turnId: number;
+				_shadowCommitFiredForTurn: boolean;
+			};
+			internals.transport.onInputTranscription?.('What is this');
+			internals.transport.onModelTurnStart?.();
+			shadow.onTranscript?.('What is this', internals.turnId);
 			expect(divergences).toHaveLength(0);
-			// next turn must not see the previous turn's text (buffer was reset)
-			transport.onInputTranscription?.('Hello, Lucy');
-			shadow.onTranscript?.('Hello, Lucy', 2);
+			// NEXT turn accumulates while the previous shadow result could still be
+			// in flight — the turn-keyed snapshot prevents cross-turn bleed
+			// (qingyun review #25-1: the un-keyed buffer raced exactly here).
+			internals._shadowCommitFiredForTurn = false; // turn-complete reset, as production does
+			internals.turnId += 1;
+			internals.transport.onInputTranscription?.('Hello, Lucy');
+			internals.transport.onModelTurnStart?.();
+			shadow.onTranscript?.('Hello, Lucy', internals.turnId);
 			expect(divergences).toHaveLength(0);
 		});
 

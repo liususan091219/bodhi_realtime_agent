@@ -2971,6 +2971,10 @@ var VoiceSession = class _VoiceSession {
   sttProvider;
   shadowSttProvider;
   _liveInputThisTurn = "";
+  /** Per-turn snapshots of the built-in transcription, keyed by turnId at
+   *  commit time — the shadow's async result then compares against ITS turn's
+   *  text, never a racing concatenation (qingyun review #25-1). Bounded. */
+  _shadowLiveSnapshots = /* @__PURE__ */ new Map();
   echoGuard;
   _commitFiredForTurn = false;
   _shadowCommitFiredForTurn = false;
@@ -3139,8 +3143,9 @@ var VoiceSession = class _VoiceSession {
         channels: this.transport.audioFormat.channels
       });
       this.shadowSttProvider.onTranscript = (text, turnId) => {
-        const live = this._liveInputThisTurn;
-        this._liveInputThisTurn = "";
+        const live = turnId !== void 0 ? this._shadowLiveSnapshots.get(turnId) ?? "" : this._liveInputThisTurn;
+        if (turnId !== void 0) this._shadowLiveSnapshots.delete(turnId);
+        else this._liveInputThisTurn = "";
         const r = compareTranscripts(live, text);
         if (r.diverged) {
           this.log(
@@ -3164,6 +3169,12 @@ var VoiceSession = class _VoiceSession {
       }
       if (this.shadowSttProvider && !this._shadowCommitFiredForTurn) {
         this._shadowCommitFiredForTurn = true;
+        this._shadowLiveSnapshots.set(this.turnId, this._liveInputThisTurn);
+        this._liveInputThisTurn = "";
+        if (this._shadowLiveSnapshots.size > 8) {
+          const oldest = this._shadowLiveSnapshots.keys().next().value;
+          if (oldest !== void 0) this._shadowLiveSnapshots.delete(oldest);
+        }
         this.shadowSttProvider.commit(this.turnId);
       }
     };

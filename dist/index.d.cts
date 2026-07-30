@@ -1993,6 +1993,10 @@ declare class VoiceSession {
     private sttProvider?;
     private shadowSttProvider?;
     private _liveInputThisTurn;
+    /** Per-turn snapshots of the built-in transcription, keyed by turnId at
+     *  commit time — the shadow's async result then compares against ITS turn's
+     *  text, never a racing concatenation (qingyun review #25-1). Bounded. */
+    private _shadowLiveSnapshots;
     private echoGuard?;
     private _commitFiredForTurn;
     private _shadowCommitFiredForTurn;
