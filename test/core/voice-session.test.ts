@@ -1718,6 +1718,150 @@ describe('VoiceSession', () => {
 	});
 
 	// =========================================================================
+	// Shadow STT wiring tests (observation-only dual transcription, 2026-07-30)
+	// =========================================================================
+
+	describe('shadow STT provider wiring', () => {
+		function createMockShadow(): STTProvider & {
+			configure: ReturnType<typeof vi.fn>;
+			start: ReturnType<typeof vi.fn>;
+			stop: ReturnType<typeof vi.fn>;
+			feedAudio: ReturnType<typeof vi.fn>;
+			commit: ReturnType<typeof vi.fn>;
+			handleInterrupted: ReturnType<typeof vi.fn>;
+			handleTurnComplete: ReturnType<typeof vi.fn>;
+		} {
+			return {
+				configure: vi.fn(),
+				start: vi.fn(async () => {}),
+				stop: vi.fn(async () => {}),
+				feedAudio: vi.fn(),
+				commit: vi.fn(),
+				handleInterrupted: vi.fn(),
+				handleTurnComplete: vi.fn(),
+				onTranscript: undefined,
+				onPartialTranscript: undefined,
+			};
+		}
+
+		it('configure() called with transport audioFormat; onTranscript wired', () => {
+			const shadow = createMockShadow();
+			session = new VoiceSession({
+				sessionId: 'sess_shadow',
+				userId: 'user_1',
+				apiKey: 'test-key',
+				agents: [createEchoAgent()],
+				initialAgent: 'echo',
+				port: 9920,
+				model: mockModel,
+				shadowSttProvider: shadow,
+			});
+			expect(shadow.configure).toHaveBeenCalledWith({
+				sampleRate: 16000,
+				bitDepth: 16,
+				channels: 1,
+			});
+			expect(shadow.onTranscript).toBeDefined();
+		});
+
+		it("the owner's self-test: live hears 'What is this news', shadow hears 'What is this' → divergence hook fires", () => {
+			const shadow = createMockShadow();
+			const divergences: Array<{ live: string; shadow: string }> = [];
+			session = new VoiceSession({
+				sessionId: 'sess_shadow',
+				userId: 'user_1',
+				apiKey: 'test-key',
+				agents: [createEchoAgent()],
+				initialAgent: 'echo',
+				port: 9921,
+				model: mockModel,
+				shadowSttProvider: shadow,
+				onTranscriptionDivergence: (live, sh) => divergences.push({ live, shadow: sh }),
+			});
+			// Drive the REAL wiring: built-in transcription accumulates…
+			const internals = session as unknown as {
+				transport: { onInputTranscription?: (t: string) => void; onModelTurnStart?: () => void };
+				turnId: number;
+			};
+			internals.transport.onInputTranscription?.('What is ');
+			internals.transport.onInputTranscription?.('this news');
+			// …the turn commits (snapshot keyed by turnId)…
+			internals.transport.onModelTurnStart?.();
+			// …then the shadow's ASYNC transcript for that turn arrives.
+			shadow.onTranscript?.('What is this', internals.turnId);
+			expect(divergences).toHaveLength(1);
+			expect(divergences[0]).toEqual({ live: 'What is this news', shadow: 'What is this' });
+		});
+
+		it('identical hearing → no divergence, and the live buffer resets between turns', () => {
+			const shadow = createMockShadow();
+			const divergences: string[] = [];
+			session = new VoiceSession({
+				sessionId: 'sess_shadow',
+				userId: 'user_1',
+				apiKey: 'test-key',
+				agents: [createEchoAgent()],
+				initialAgent: 'echo',
+				port: 9922,
+				model: mockModel,
+				shadowSttProvider: shadow,
+				onTranscriptionDivergence: (live) => divergences.push(live),
+			});
+			const internals = session as unknown as {
+				transport: { onInputTranscription?: (t: string) => void; onModelTurnStart?: () => void };
+				turnId: number;
+				_shadowCommitFiredForTurn: boolean;
+			};
+			internals.transport.onInputTranscription?.('What is this');
+			internals.transport.onModelTurnStart?.();
+			shadow.onTranscript?.('What is this', internals.turnId);
+			expect(divergences).toHaveLength(0);
+			// NEXT turn accumulates while the previous shadow result could still be
+			// in flight — the turn-keyed snapshot prevents cross-turn bleed
+			// (qingyun review #25-1: the un-keyed buffer raced exactly here).
+			internals._shadowCommitFiredForTurn = false; // turn-complete reset, as production does
+			internals.turnId += 1;
+			internals.transport.onInputTranscription?.('Hello, Lucy');
+			internals.transport.onModelTurnStart?.();
+			shadow.onTranscript?.('Hello, Lucy', internals.turnId);
+			expect(divergences).toHaveLength(0);
+		});
+
+		it('feedAudio + stop lifecycle mirror sttProvider; ignored when exclusive sttProvider present', async () => {
+			const shadow = createMockShadow();
+			session = new VoiceSession({
+				sessionId: 'sess_shadow',
+				userId: 'user_1',
+				apiKey: 'test-key',
+				agents: [createEchoAgent()],
+				initialAgent: 'echo',
+				port: 9923,
+				model: mockModel,
+				shadowSttProvider: shadow,
+			});
+			await session.close();
+			expect(shadow.stop).toHaveBeenCalled();
+			session = null;
+
+			const shadow2 = createMockShadow();
+			const exclusive = createMockShadow();
+			session = new VoiceSession({
+				sessionId: 'sess_shadow2',
+				userId: 'user_1',
+				apiKey: 'test-key',
+				agents: [createEchoAgent()],
+				initialAgent: 'echo',
+				port: 9924,
+				model: mockModel,
+				sttProvider: exclusive,
+				shadowSttProvider: shadow2,
+			});
+			// nothing to shadow in exclusive mode — never wired
+			expect(shadow2.onTranscript).toBeUndefined();
+		});
+	});
+
+	// =========================================================================
 	// STT provider wiring tests
 	// =========================================================================
 
