@@ -443,10 +443,7 @@ export class VoiceSession {
 								[
 									{
 										role: 'user',
-										text:
-											`[TRANSCRIPTION CORRECTION — not the user speaking] A second transcription shows the user actually said: "${text}". ` +
-											`You answered a mishearing ("${live}"). In ONE short sentence acknowledge the correction ` +
-											`(e.g. "sorry — you asked about …"), then answer the user's ACTUAL question. Do not repeat the wrong answer.`,
+										text: `[TRANSCRIPTION CORRECTION — not the user speaking] A second transcription shows the user actually said: "${text}". You answered a mishearing ("${live}"). In ONE short sentence acknowledge the correction (e.g. "sorry — you asked about …"), then answer the user's ACTUAL question. Do not repeat the wrong answer.`,
 									},
 								],
 								true,

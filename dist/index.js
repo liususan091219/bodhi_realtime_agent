@@ -4071,11 +4071,34 @@ var GeminiBatchSTTProvider = class {
   _audioChunks = [];
   _bufferBytes = 0;
   _wasInterrupted = false;
+  _contextHint;
   onTranscript;
   onPartialTranscript;
   constructor(config) {
     this.ai = new GoogleGenAI2({ apiKey: config.apiKey });
     this.model = config.model;
+    this._contextHint = config.contextHint;
+  }
+  /** Set/replace the domain vocabulary hint after construction. */
+  setContextHint(hint) {
+    this._contextHint = hint;
+  }
+  /** Resolve the current hint (function form re-read per call). */
+  resolveContextHint() {
+    const h = typeof this._contextHint === "function" ? this._contextHint() : this._contextHint;
+    const trimmed = h?.trim();
+    return trimmed ? trimmed : void 0;
+  }
+  /** Build the transcription prompt, with the vocabulary hint when present.
+   *  Exposed for tests. */
+  buildPrompt() {
+    const base = "Transcribe the spoken words in this audio. If the audio contains only silence, background noise, or no clear speech, respond with exactly: [SILENCE]";
+    const hint = this.resolveContextHint();
+    if (!hint) return base;
+    return `${base}
+The speaker is discussing the following material; these exact terms are likely to occur:
+${hint}
+When a phrase in the audio plausibly matches one of these terms, transcribe the term with this exact spelling instead of a phonetic guess. Do NOT force a match onto speech that clearly says something else.`;
   }
   configure(audio) {
     if (audio.bitDepth !== 16) {
@@ -4124,7 +4147,7 @@ var GeminiBatchSTTProvider = class {
               }
             },
             {
-              text: "Transcribe the spoken words in this audio. If the audio contains only silence, background noise, or no clear speech, respond with exactly: [SILENCE]"
+              text: this.buildPrompt()
             }
           ]
         }

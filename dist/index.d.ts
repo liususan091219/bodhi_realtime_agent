@@ -2212,6 +2212,15 @@ interface GeminiBatchSTTConfig {
     apiKey: string;
     /** Model name for STT (e.g. "gemini-3-flash-preview"). */
     model: string;
+    /**
+     * Domain vocabulary hint appended to the transcription prompt — key terms
+     * the session is about (e.g. a slide deck's technical terms). The model is
+     * told to prefer these exact spellings when the audio plausibly matches, so
+     * garbled audio near a known term resolves to the term instead of a phonetic
+     * guess ("mass derivation" → "math derivation"). A function is re-read per
+     * commit so the host can supply it AFTER construction (deck loads late).
+     */
+    contextHint?: string | (() => string | undefined);
 }
 /**
  * STTProvider that uses a separate Gemini model via generateContent() for
@@ -2227,9 +2236,17 @@ declare class GeminiBatchSTTProvider implements STTProvider {
     private _audioChunks;
     private _bufferBytes;
     private _wasInterrupted;
+    private _contextHint?;
     onTranscript?: (text: string, turnId: number | undefined) => void;
     onPartialTranscript?: (text: string) => void;
     constructor(config: GeminiBatchSTTConfig);
+    /** Set/replace the domain vocabulary hint after construction. */
+    setContextHint(hint: string | (() => string | undefined) | undefined): void;
+    /** Resolve the current hint (function form re-read per call). */
+    private resolveContextHint;
+    /** Build the transcription prompt, with the vocabulary hint when present.
+     *  Exposed for tests. */
+    buildPrompt(): string;
     configure(audio: STTAudioConfig): void;
     start(): Promise<void>;
     stop(): Promise<void>;

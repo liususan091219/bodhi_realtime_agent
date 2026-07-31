@@ -93,7 +93,7 @@ describe('isSubstantiveDivergence (mute gate — owner: "mute 的太多了")', (
 });
 
 describe('isSubstantiveDivergence — stutter repeats (live false-correction 2026-07-30 22:00)', () => {
-	it("repeat-count differences of the same word never mute", () => {
+	it('repeat-count differences of the same word never mute', () => {
 		expect(
 			isSubstantiveDivergence(
 				"What's What What What should I get How should I get started besides the video?",
