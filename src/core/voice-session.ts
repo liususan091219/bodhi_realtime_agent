@@ -23,7 +23,7 @@ import { HooksManager } from './hooks.js';
 import { InteractionModeManager } from './interaction-mode.js';
 import { MemoryCacheManager } from './memory-cache-manager.js';
 import { SessionManager } from './session-manager.js';
-import { compareTranscripts } from './shadow-stt.js';
+import { compareTranscripts, isSubstantiveDivergence } from './shadow-stt.js';
 import { ToolCallRouter } from './tool-call-router.js';
 import { TranscriptManager } from './transcript-manager.js';
 
@@ -87,6 +87,13 @@ export interface VoiceSessionConfig {
 	/** Called when the shadow STT disagrees with the built-in transcription
 	 *  (normalized compare; containment = streaming truncation, not a mishear). */
 	onTranscriptionDivergence?: (liveText: string, shadowText: string, turnId?: number) => void;
+	/** With shadowSttProvider set: on divergence, SPEAK a self-correction — the
+	 *  model is told what the user actually said and answers the real question
+	 *  ("说错自纠", owner-selected option ① 2026-07-30). The shadow result
+	 *  arrives 1-3s behind live speech, so the wrong first answer still starts
+	 *  playing; this interrupts it with the correction. Stale results (a newer
+	 *  turn already started) never fire. Default OFF — observation only. */
+	divergenceCorrection?: boolean;
 	/** Behavior categories for dynamic runtime tuning (speech speed, verbosity, etc.). */
 	behaviors?: BehaviorCategory[];
 	/** Enable memory distillation. Extracts durable user facts from conversation and persists them. */
@@ -162,7 +169,7 @@ export class VoiceSession {
 	private _shadowLiveSnapshots = new Map<number, string>();
 	private echoGuard?: EchoGuard;
 	private _commitFiredForTurn = false;
-	private _shadowCommitFiredForTurn = false;
+	private _shadowLastCommittedTurn = -1;
 	private config: VoiceSessionConfig;
 	private directiveManager = new DirectiveManager();
 	private transcriptManager!: TranscriptManager;
@@ -397,6 +404,10 @@ export class VoiceSession {
 				if (turnId !== undefined) this._shadowLiveSnapshots.delete(turnId);
 				else this._liveInputThisTurn = '';
 				const r = compareTranscripts(live, text);
+				// Heartbeat at every compare (not just divergences) — without this a
+				// clean session is indistinguishable from a dead shadow (found while
+				// preparing the owner's live test 2026-07-30).
+				this.log(`[ShadowSTT] turn ${turnId ?? '?'} compared: ${r.reason}`);
 				if (r.diverged) {
 					this.log(
 						`[ShadowSTT] DIVERGENCE turn=${turnId ?? '?'} live="${r.normalizedLive}" shadow="${r.normalizedShadow}"`,
@@ -405,6 +416,41 @@ export class VoiceSession {
 						this.config.onTranscriptionDivergence?.(live, text, turnId);
 					} catch {
 						/* observer must never break the session */
+					}
+					// Option ① self-correction (owner 2026-07-30 "那不还是错"):
+					// only for the CURRENT turn — if the user already moved on to a
+					// newer turn, a late correction would derail the live exchange.
+					// Two-tier (owner 2026-07-30 "exact match 不一样就 mute 那 mute 的太多了"):
+					// EVERY divergence is logged above (data); only a MEANING-BEARING one
+					// mutes and corrects — filler/short-artifact diffs stay silent.
+					if (
+						this.config.divergenceCorrection &&
+						turnId !== undefined &&
+						turnId === this.turnId &&
+						isSubstantiveDivergence(live, text)
+					) {
+						this.log(`[ShadowSTT] speaking self-correction for turn ${turnId}`);
+						try {
+							// Owner 2026-07-30 "如果这两个不一样的话你可以把他 mute 掉呀":
+							// cut the WRONG answer's remaining audio NOW instead of letting
+							// it finish — the client's turn.interrupted handler stops all
+							// active playback sources immediately. The user hears ~1-2s of
+							// the wrong answer (shadow latency floor), then silence, then
+							// the correction. sendContent below also interrupts the model
+							// side, so generation stops too.
+							this.clientTransport.sendJsonToClient({ type: 'turn.interrupted' });
+							this.transport.sendContent(
+								[
+									{
+										role: 'user',
+										text: `[TRANSCRIPTION CORRECTION — not the user speaking] A second transcription shows the user actually said: "${text}". You answered a mishearing ("${live}"). In ONE short sentence acknowledge the correction (e.g. "sorry — you asked about …"), then answer the user's ACTUAL question. Do not repeat the wrong answer.`,
+									},
+								],
+								true,
+							);
+						} catch {
+							/* transport hiccup must never break the session; the divergence is already logged */
+						}
 					}
 				}
 			};
@@ -420,8 +466,12 @@ export class VoiceSession {
 				this._commitFiredForTurn = true;
 				this.sttProvider.commit(this.turnId);
 			}
-			if (this.shadowSttProvider && !this._shadowCommitFiredForTurn) {
-				this._shadowCommitFiredForTurn = true;
+			if (this.shadowSttProvider && this._shadowLastCommittedTurn !== this.turnId) {
+				// Per-turnId commit tracking (2026-07-30 live finding: the boolean
+				// latch reset too rarely in the discord flow — 2 compares in a
+				// 33-turn session; the shadow starved). Keying on turnId cannot
+				// starve: each new turn commits exactly once, no reset path needed.
+				this._shadowLastCommittedTurn = this.turnId;
 				// Snapshot the live text for THIS turn before the next one can
 				// start accumulating — the async shadow result pairs by turnId.
 				this._shadowLiveSnapshots.set(this.turnId, this._liveInputThisTurn);
@@ -712,7 +762,6 @@ export class VoiceSession {
 			}
 			this.sttProvider.handleTurnComplete();
 			this._commitFiredForTurn = false;
-			this._shadowCommitFiredForTurn = false;
 		}
 
 		this.transcriptManager.flush();

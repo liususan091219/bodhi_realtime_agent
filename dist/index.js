@@ -2946,6 +2946,46 @@ function compareTranscripts(liveText, shadowText) {
   }
   return { diverged: true, reason: "diverged", normalizedLive: live, normalizedShadow: shadow };
 }
+var FILLERS = /* @__PURE__ */ new Set([
+  "uh",
+  "um",
+  "ah",
+  "oh",
+  "eh",
+  "mm",
+  "hmm",
+  "yeah",
+  "yes",
+  "ok",
+  "okay",
+  "hi",
+  "hey",
+  "hello",
+  "like",
+  "so",
+  "well",
+  "just",
+  "\u5443",
+  "\u55EF",
+  "\u554A",
+  "\u54E6",
+  "\u5C31\u662F",
+  "\u90A3\u4E2A",
+  "\u8FD9\u4E2A",
+  "\u5C31"
+]);
+function isSubstantiveDivergence(liveText, shadowText) {
+  const strip = (s) => normalizeTranscript(s).split(" ").filter((w) => w && !FILLERS.has(w));
+  const a = strip(liveText);
+  const b = strip(shadowText);
+  if (a.join(" ") === b.join(" ")) return false;
+  const setA = new Set(a);
+  const setB = new Set(b);
+  const diff = [];
+  for (const w of setA) if (!setB.has(w)) diff.push(w);
+  for (const w of setB) if (!setA.has(w)) diff.push(w);
+  return diff.some((w) => w.length >= 3 || /\d/.test(w));
+}
 
 // src/core/voice-session.ts
 var VoiceSession = class _VoiceSession {
@@ -2977,7 +3017,7 @@ var VoiceSession = class _VoiceSession {
   _shadowLiveSnapshots = /* @__PURE__ */ new Map();
   echoGuard;
   _commitFiredForTurn = false;
-  _shadowCommitFiredForTurn = false;
+  _shadowLastCommittedTurn = -1;
   config;
   directiveManager = new DirectiveManager();
   transcriptManager;
@@ -3147,6 +3187,7 @@ var VoiceSession = class _VoiceSession {
         if (turnId !== void 0) this._shadowLiveSnapshots.delete(turnId);
         else this._liveInputThisTurn = "";
         const r = compareTranscripts(live, text);
+        this.log(`[ShadowSTT] turn ${turnId ?? "?"} compared: ${r.reason}`);
         if (r.diverged) {
           this.log(
             `[ShadowSTT] DIVERGENCE turn=${turnId ?? "?"} live="${r.normalizedLive}" shadow="${r.normalizedShadow}"`
@@ -3154,6 +3195,22 @@ var VoiceSession = class _VoiceSession {
           try {
             this.config.onTranscriptionDivergence?.(live, text, turnId);
           } catch {
+          }
+          if (this.config.divergenceCorrection && turnId !== void 0 && turnId === this.turnId && isSubstantiveDivergence(live, text)) {
+            this.log(`[ShadowSTT] speaking self-correction for turn ${turnId}`);
+            try {
+              this.clientTransport.sendJsonToClient({ type: "turn.interrupted" });
+              this.transport.sendContent(
+                [
+                  {
+                    role: "user",
+                    text: `[TRANSCRIPTION CORRECTION \u2014 not the user speaking] A second transcription shows the user actually said: "${text}". You answered a mishearing ("${live}"). In ONE short sentence acknowledge the correction (e.g. "sorry \u2014 you asked about \u2026"), then answer the user's ACTUAL question. Do not repeat the wrong answer.`
+                  }
+                ],
+                true
+              );
+            } catch {
+            }
           }
         }
       };
@@ -3167,8 +3224,8 @@ var VoiceSession = class _VoiceSession {
         this._commitFiredForTurn = true;
         this.sttProvider.commit(this.turnId);
       }
-      if (this.shadowSttProvider && !this._shadowCommitFiredForTurn) {
-        this._shadowCommitFiredForTurn = true;
+      if (this.shadowSttProvider && this._shadowLastCommittedTurn !== this.turnId) {
+        this._shadowLastCommittedTurn = this.turnId;
         this._shadowLiveSnapshots.set(this.turnId, this._liveInputThisTurn);
         this._liveInputThisTurn = "";
         if (this._shadowLiveSnapshots.size > 8) {
@@ -3387,7 +3444,6 @@ var VoiceSession = class _VoiceSession {
       }
       this.sttProvider.handleTurnComplete();
       this._commitFiredForTurn = false;
-      this._shadowCommitFiredForTurn = false;
     }
     this.transcriptManager.flush();
     this.turnId++;
@@ -4015,11 +4071,34 @@ var GeminiBatchSTTProvider = class {
   _audioChunks = [];
   _bufferBytes = 0;
   _wasInterrupted = false;
+  _contextHint;
   onTranscript;
   onPartialTranscript;
   constructor(config) {
     this.ai = new GoogleGenAI2({ apiKey: config.apiKey });
     this.model = config.model;
+    this._contextHint = config.contextHint;
+  }
+  /** Set/replace the domain vocabulary hint after construction. */
+  setContextHint(hint) {
+    this._contextHint = hint;
+  }
+  /** Resolve the current hint (function form re-read per call). */
+  resolveContextHint() {
+    const h = typeof this._contextHint === "function" ? this._contextHint() : this._contextHint;
+    const trimmed = h?.trim();
+    return trimmed ? trimmed : void 0;
+  }
+  /** Build the transcription prompt, with the vocabulary hint when present.
+   *  Exposed for tests. */
+  buildPrompt() {
+    const base = "Transcribe the spoken words in this audio. If the audio contains only silence, background noise, or no clear speech, respond with exactly: [SILENCE]";
+    const hint = this.resolveContextHint();
+    if (!hint) return base;
+    return `${base}
+The speaker is discussing the following material; these exact terms are likely to occur:
+${hint}
+When a phrase in the audio plausibly matches one of these terms, transcribe the term with this exact spelling instead of a phonetic guess. Do NOT force a match onto speech that clearly says something else.`;
   }
   configure(audio) {
     if (audio.bitDepth !== 16) {
@@ -4068,7 +4147,7 @@ var GeminiBatchSTTProvider = class {
               }
             },
             {
-              text: "Transcribe the spoken words in this audio. If the audio contains only silence, background noise, or no clear speech, respond with exactly: [SILENCE]"
+              text: this.buildPrompt()
             }
           ]
         }

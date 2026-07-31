@@ -1926,6 +1926,13 @@ interface VoiceSessionConfig {
     /** Called when the shadow STT disagrees with the built-in transcription
      *  (normalized compare; containment = streaming truncation, not a mishear). */
     onTranscriptionDivergence?: (liveText: string, shadowText: string, turnId?: number) => void;
+    /** With shadowSttProvider set: on divergence, SPEAK a self-correction — the
+     *  model is told what the user actually said and answers the real question
+     *  ("说错自纠", owner-selected option ① 2026-07-30). The shadow result
+     *  arrives 1-3s behind live speech, so the wrong first answer still starts
+     *  playing; this interrupts it with the correction. Stale results (a newer
+     *  turn already started) never fire. Default OFF — observation only. */
+    divergenceCorrection?: boolean;
     /** Behavior categories for dynamic runtime tuning (speech speed, verbosity, etc.). */
     behaviors?: BehaviorCategory[];
     /** Enable memory distillation. Extracts durable user facts from conversation and persists them. */
@@ -1999,7 +2006,7 @@ declare class VoiceSession {
     private _shadowLiveSnapshots;
     private echoGuard?;
     private _commitFiredForTurn;
-    private _shadowCommitFiredForTurn;
+    private _shadowLastCommittedTurn;
     private config;
     private directiveManager;
     private transcriptManager;
@@ -2205,6 +2212,15 @@ interface GeminiBatchSTTConfig {
     apiKey: string;
     /** Model name for STT (e.g. "gemini-3-flash-preview"). */
     model: string;
+    /**
+     * Domain vocabulary hint appended to the transcription prompt — key terms
+     * the session is about (e.g. a slide deck's technical terms). The model is
+     * told to prefer these exact spellings when the audio plausibly matches, so
+     * garbled audio near a known term resolves to the term instead of a phonetic
+     * guess ("mass derivation" → "math derivation"). A function is re-read per
+     * commit so the host can supply it AFTER construction (deck loads late).
+     */
+    contextHint?: string | (() => string | undefined);
 }
 /**
  * STTProvider that uses a separate Gemini model via generateContent() for
@@ -2220,9 +2236,17 @@ declare class GeminiBatchSTTProvider implements STTProvider {
     private _audioChunks;
     private _bufferBytes;
     private _wasInterrupted;
+    private _contextHint?;
     onTranscript?: (text: string, turnId: number | undefined) => void;
     onPartialTranscript?: (text: string) => void;
     constructor(config: GeminiBatchSTTConfig);
+    /** Set/replace the domain vocabulary hint after construction. */
+    setContextHint(hint: string | (() => string | undefined) | undefined): void;
+    /** Resolve the current hint (function form re-read per call). */
+    private resolveContextHint;
+    /** Build the transcription prompt, with the vocabulary hint when present.
+     *  Exposed for tests. */
+    buildPrompt(): string;
     configure(audio: STTAudioConfig): void;
     start(): Promise<void>;
     stop(): Promise<void>;

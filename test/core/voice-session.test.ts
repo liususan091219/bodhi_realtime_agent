@@ -1810,7 +1810,6 @@ describe('VoiceSession', () => {
 			const internals = session as unknown as {
 				transport: { onInputTranscription?: (t: string) => void; onModelTurnStart?: () => void };
 				turnId: number;
-				_shadowCommitFiredForTurn: boolean;
 			};
 			internals.transport.onInputTranscription?.('What is this');
 			internals.transport.onModelTurnStart?.();
@@ -1819,12 +1818,79 @@ describe('VoiceSession', () => {
 			// NEXT turn accumulates while the previous shadow result could still be
 			// in flight — the turn-keyed snapshot prevents cross-turn bleed
 			// (qingyun review #25-1: the un-keyed buffer raced exactly here).
-			internals._shadowCommitFiredForTurn = false; // turn-complete reset, as production does
-			internals.turnId += 1;
+			internals.turnId += 1; // per-turnId tracking needs no latch reset
 			internals.transport.onInputTranscription?.('Hello, Lucy');
 			internals.transport.onModelTurnStart?.();
 			shadow.onTranscript?.('Hello, Lucy', internals.turnId);
 			expect(divergences).toHaveLength(0);
+		});
+
+		it('divergenceCorrection ON: current-turn divergence speaks a correction carrying the shadow text', () => {
+			const shadow = createMockShadow();
+			session = new VoiceSession({
+				sessionId: 'sess_corr',
+				userId: 'user_1',
+				apiKey: 'test-key',
+				agents: [createEchoAgent()],
+				initialAgent: 'echo',
+				port: 9925,
+				model: mockModel,
+				shadowSttProvider: shadow,
+				divergenceCorrection: true,
+			});
+			const internals = session as unknown as {
+				transport: {
+					onInputTranscription?: (t: string) => void;
+					onModelTurnStart?: () => void;
+					sendContent: (turns: unknown[], done: boolean) => void;
+				};
+				turnId: number;
+			};
+			const sent = vi.spyOn(internals.transport, 'sendContent').mockImplementation(() => {});
+			const clientTransport = (
+				session as unknown as { clientTransport: { sendJsonToClient: (m: unknown) => void } }
+			).clientTransport;
+			const muted = vi.spyOn(clientTransport, 'sendJsonToClient').mockImplementation(() => {});
+			internals.transport.onInputTranscription?.('What is this news');
+			internals.transport.onModelTurnStart?.();
+			shadow.onTranscript?.('What is this', internals.turnId);
+			// the wrong answer's playback is CUT first (owner: "把他 mute 掉")…
+			expect(muted).toHaveBeenCalledWith({ type: 'turn.interrupted' });
+			// …then exactly one correction turn goes to the model.
+			expect(sent).toHaveBeenCalledTimes(1);
+			const arg = sent.mock.calls[0][0] as Array<{ text: string }>;
+			expect(arg[0].text).toContain('What is this');
+			expect(arg[0].text).toContain('TRANSCRIPTION CORRECTION');
+		});
+
+		it('divergenceCorrection: stale turn never fires; flag OFF never fires', () => {
+			const shadow = createMockShadow();
+			session = new VoiceSession({
+				sessionId: 'sess_corr2',
+				userId: 'user_1',
+				apiKey: 'test-key',
+				agents: [createEchoAgent()],
+				initialAgent: 'echo',
+				port: 9926,
+				model: mockModel,
+				shadowSttProvider: shadow,
+				divergenceCorrection: true,
+			});
+			const internals = session as unknown as {
+				transport: {
+					onInputTranscription?: (t: string) => void;
+					onModelTurnStart?: () => void;
+					sendContent: (turns: unknown[], done: boolean) => void;
+				};
+				turnId: number;
+			};
+			const sent = vi.spyOn(internals.transport, 'sendContent').mockImplementation(() => {});
+			internals.transport.onInputTranscription?.('What is this news');
+			internals.transport.onModelTurnStart?.();
+			const staleTurn = internals.turnId;
+			internals.turnId = staleTurn + 1; // conversation moved on before the shadow result landed
+			shadow.onTranscript?.('What is this', staleTurn);
+			expect(sent).not.toHaveBeenCalled(); // diverged, logged — but stale: no spoken correction
 		});
 
 		it('feedAudio + stop lifecycle mirror sttProvider; ignored when exclusive sttProvider present', async () => {
