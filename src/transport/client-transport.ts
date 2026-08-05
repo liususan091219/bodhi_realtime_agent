@@ -123,6 +123,16 @@ export class ClientTransport {
 		const takeover = params.get('takeover') === '1';
 		const role: ClientConnectionRole = params.get('verify') === '1' ? 'verify' : 'real';
 
+		// A stale incumbent whose socket is no longer OPEN (CLOSING/CLOSED — its
+		// own 'close' event has not fired yet) does not actually occupy the slot.
+		// Judging occupancy by `this.client` truthiness alone would wrongly reject
+		// the same user's immediate reconnect with 4409 client-busy. Quietly
+		// release it (role-appropriate disconnect callback, null the slot) so the
+		// newcomer attaches normally.
+		if (this.client && this.client.readyState !== 1) {
+			this.releaseIncumbent();
+		}
+
 		if (this.client) {
 			if (this.clientRole === 'real') {
 				if (role === 'real' && takeover) {
@@ -175,26 +185,39 @@ export class ClientTransport {
 		ws.close(CLOSE_CODE_CLIENT_BUSY, CLOSE_REASON_CLIENT_BUSY);
 	}
 
-	/** Detach the incumbent connection deliberately (takeover/preemption): fire its
-	 *  role-appropriate disconnect callback synchronously, then close its socket.
-	 *  The socket's own 'close' handler is a no-op afterwards (client no longer === ws). */
-	private detachIncumbent(code: number, reason: string): void {
+	/** Release the incumbent from the slot: strip its 'message' listener so a
+	 *  superseded/detached socket can never inject another frame, null the slot,
+	 *  and fire its role-appropriate disconnect callback synchronously. Returns
+	 *  the released socket so callers may close it with a chosen code. The
+	 *  socket's own 'close' handler is a no-op afterwards (client no longer === ws). */
+	private releaseIncumbent(): WebSocket | null {
 		const incumbent = this.client;
 		const incumbentRole = this.clientRole;
 		this.client = null;
 		this.clientRole = null;
+		incumbent?.removeAllListeners('message');
 		if (incumbentRole === 'real') {
 			this.callbacks.onClientDisconnected?.();
 		} else if (incumbentRole === 'verify') {
 			this.callbacks.onVerifierDisconnected?.();
 		}
-		incumbent?.close(code, reason);
+		return incumbent;
+	}
+
+	/** Detach the incumbent connection deliberately (takeover/preemption): release
+	 *  it from the slot, then close its socket with the given application code. */
+	private detachIncumbent(code: number, reason: string): void {
+		this.releaseIncumbent()?.close(code, reason);
 	}
 
 	private attach(ws: WebSocket, role: ClientConnectionRole): void {
 		// Attach event handlers BEFORE setting this.client to avoid
 		// a race where messages arrive before handlers are registered.
 		ws.on('message', (data: Buffer, isBinary: boolean) => {
+			// A superseded/detached incumbent (takeover/preemption/stale release)
+			// may still have queued frames after it lost the slot: never let a
+			// socket that is no longer THE attached client inject into the session.
+			if (this.client !== ws) return;
 			// Verification-role isolation (Y3): a verifier observes outbound state
 			// only — its inbound frames must never reach user-side callbacks.
 			if (role !== 'real') return;

@@ -397,6 +397,42 @@ describe('ClientTransport pre-client interception', () => {
 			await tick();
 			expect(onClientDisconnected).toHaveBeenCalledOnce();
 		});
+
+		it('a stale incumbent whose socket already closed does not 4409 the same user immediate reconnect', async () => {
+			const onClientConnected = vi.fn();
+			const onClientDisconnected = vi.fn();
+			transport = new ClientTransport(TEST_PORT, { onClientConnected, onClientDisconnected });
+			await transport.start();
+
+			const first = await open();
+			await tick();
+			expect(onClientConnected).toHaveBeenCalledOnce();
+
+			// Close the incumbent and, WITHOUT waiting for the server to finish
+			// processing its 'close', immediately open a fresh real connection. By the
+			// time the newcomer is processed the incumbent socket is CLOSING/CLOSED
+			// (its 'close' may not have fired yet); a non-OPEN incumbent must be
+			// treated as absent so the newcomer attaches instead of hitting 4409.
+			first.close();
+			const second = new WebSocket(`ws://localhost:${TEST_PORT}`);
+			let rejected: { code: number; reason: string } | null = null;
+			second.on('close', (code, reason) => {
+				rejected = { code, reason: reason.toString() };
+			});
+			await new Promise<void>((resolve, reject) => {
+				second.on('open', () => resolve());
+				second.on('error', reject);
+			});
+			await tick();
+
+			// The newcomer attached — never rejected with client-busy.
+			expect(rejected).toBeNull();
+			expect(transport.isClientConnected).toBe(true);
+			expect(onClientConnected).toHaveBeenCalledTimes(2);
+
+			second.close();
+			await closed(second);
+		});
 	});
 
 	describe('?takeover=1 (W5)', () => {
@@ -448,6 +484,65 @@ describe('ClientTransport pre-client interception', () => {
 
 			ws.close();
 			await closed(ws);
+		});
+
+		it('a superseded incumbent injects ZERO frames after the takeover detach boundary', async () => {
+			let detached = false;
+			let leakedAfterDetach = 0;
+			const onAudioFromClient = vi.fn(() => {
+				if (detached) leakedAfterDetach++;
+			});
+			const onJsonFromClient = vi.fn(() => {
+				if (detached) leakedAfterDetach++;
+			});
+			const onClientConnected = vi.fn();
+			const onClientDisconnected = vi.fn(() => {
+				// The incumbent's takeover detach is the boundary: any inbound frame
+				// delivered from here on is a leak from a socket that lost the slot.
+				detached = true;
+			});
+			transport = new ClientTransport(TEST_PORT, {
+				onAudioFromClient,
+				onJsonFromClient,
+				onClientConnected,
+				onClientDisconnected,
+			});
+			await transport.start();
+
+			const incumbent = await open();
+			await tick();
+			expect(onClientConnected).toHaveBeenCalledOnce();
+
+			// Flood binary + JSON from the incumbent continuously across the takeover
+			// boundary. Frames the server reads before detach deliver legitimately
+			// (detached === false); any delivery seen while detached === true is a leak.
+			const flood = setInterval(() => {
+				if (incumbent.readyState !== WebSocket.OPEN) return;
+				try {
+					incumbent.send(Buffer.alloc(64, 3));
+					incumbent.send(JSON.stringify({ type: 'ui.response', from: 'incumbent' }));
+				} catch {
+					// socket transitioning to closed — ignore
+				}
+			}, 1);
+
+			const challenger = await open('/?takeover=1');
+			const { code } = await closed(incumbent);
+			expect(code).toBe(CLOSE_CODE_SUPERSEDED_BY_TAKEOVER);
+
+			await tick();
+			clearInterval(flood);
+			await tick();
+
+			// The takeover really happened: the challenger is the attached real client.
+			expect(onClientDisconnected).toHaveBeenCalledOnce();
+			expect(onClientConnected).toHaveBeenCalledTimes(2);
+			expect(transport.isClientConnected).toBe(true);
+			// The superseded incumbent delivered nothing after losing the slot.
+			expect(leakedAfterDetach).toBe(0);
+
+			challenger.close();
+			await closed(challenger);
 		});
 	});
 
