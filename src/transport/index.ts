@@ -1,8 +1,20 @@
 // SPDX-License-Identifier: MIT
 
 export { AudioBuffer } from './audio-buffer.js';
-export { ClientTransport } from './client-transport.js';
-export type { ClientTransportCallbacks } from './client-transport.js';
+export {
+	ClientTransport,
+	CLOSE_CODE_CLIENT_BUSY,
+	CLOSE_CODE_SUPERSEDED_BY_TAKEOVER,
+	CLOSE_CODE_VERIFIER_PREEMPTED,
+	CLOSE_REASON_CLIENT_BUSY,
+	CLOSE_REASON_SUPERSEDED_BY_TAKEOVER,
+	CLOSE_REASON_VERIFIER_PREEMPTED,
+} from './client-transport.js';
+export type {
+	ClientConnectionRole,
+	ClientTransportCallbacks,
+	ClientTransportOptions,
+} from './client-transport.js';
 export { bestEnvelopeLag, EchoGuard, envelopePearson } from './echo-guard.js';
 export type { EchoCheckResult, EchoEnvEntry, EchoGuardConfig } from './echo-guard.js';
 export { ElevenLabsSTTProvider } from './elevenlabs-stt-provider.js';

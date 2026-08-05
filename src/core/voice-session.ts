@@ -113,6 +113,18 @@ export interface VoiceSessionConfig {
 	 *  overlapped user speech — a deliberate per-deployment choice); env
 	 *  BODHI_ECHO_GUARD=0 hard-disables. */
 	echoGuard?: EchoGuardConfig;
+	/** Supplies the JSON state frame sent to `?probe=1` health-probe connections
+	 *  on the client WebSocket server. When absent, probes are upgraded and
+	 *  closed (code 1000) without a frame. Probe sockets never attach as the
+	 *  client and never fire connect/disconnect handling. */
+	probeState?: () => object;
+	/** A verification-role (`?verify=1`) connection attached. Narrow hook for
+	 *  embedders (e.g. to wake upstream); real-client connect side effects
+	 *  (greeting, context replay, clientConnected accounting) never run for it. */
+	onVerifierConnected?: () => void;
+	/** The verification-role connection detached (clean close or preemption by
+	 *  an arriving real client). */
+	onVerifierDisconnected?: () => void;
 }
 
 /**
@@ -492,8 +504,12 @@ export class VoiceSession {
 				onJsonFromClient: (message) => this.handleJsonFromClient(message),
 				onClientConnected: () => this.handleClientConnected(),
 				onClientDisconnected: () => this.handleClientDisconnected(),
+				onVerifierConnected: config.onVerifierConnected,
+				onVerifierDisconnected: config.onVerifierDisconnected,
 			},
 			config.host ?? '0.0.0.0',
+			undefined,
+			{ probeState: config.probeState },
 		);
 
 		// Forward GUI events from EventBus to the client as JSON text frames
