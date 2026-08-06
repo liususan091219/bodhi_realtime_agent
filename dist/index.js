@@ -2048,15 +2048,23 @@ var AudioBuffer = class {
 };
 
 // src/transport/client-transport.ts
+var CLOSE_CODE_CLIENT_BUSY = 4409;
+var CLOSE_REASON_CLIENT_BUSY = "client-busy";
+var CLOSE_CODE_SUPERSEDED_BY_TAKEOVER = 4410;
+var CLOSE_REASON_SUPERSEDED_BY_TAKEOVER = "superseded-by-takeover";
+var CLOSE_CODE_VERIFIER_PREEMPTED = 4411;
+var CLOSE_REASON_VERIFIER_PREEMPTED = "verifier-preempted";
 var ClientTransport = class {
-  constructor(port, callbacks, host = "0.0.0.0", listenTimeoutMs = 1e4) {
+  constructor(port, callbacks, host = "0.0.0.0", listenTimeoutMs = 1e4, options = {}) {
     this.port = port;
     this.callbacks = callbacks;
     this.host = host;
     this.listenTimeoutMs = listenTimeoutMs;
+    this.options = options;
   }
   wss = null;
   client = null;
+  clientRole = null;
   audioBuffer = new AudioBuffer();
   _buffering = false;
   async start() {
@@ -2069,32 +2077,121 @@ var ClientTransport = class {
         clearTimeout(timer);
         resolve();
       });
-      this.wss.on("connection", (ws) => {
-        ws.on("message", (data, isBinary) => {
-          if (isBinary) {
-            if (this._buffering) {
-              this.audioBuffer.push(data);
-            } else {
-              this.callbacks.onAudioFromClient?.(data);
-            }
-          } else {
-            try {
-              const message = JSON.parse(data.toString());
-              this.callbacks.onJsonFromClient?.(message);
-            } catch {
-            }
-          }
-        });
-        ws.on("close", () => {
-          this.client = null;
-          this.callbacks.onClientDisconnected?.();
-        });
-        ws.on("error", () => {
-        });
-        this.client = ws;
-        this.callbacks.onClientConnected?.();
+      this.wss.on("connection", (ws, req) => {
+        this.handleConnection(ws, req);
       });
     });
+  }
+  /** Pre-client interception: classify the connection BEFORE any `client` assignment. */
+  handleConnection(ws, req) {
+    const params = new URL(req.url ?? "/", "ws://localhost").searchParams;
+    if (params.get("probe") === "1") {
+      this.handleProbe(ws);
+      return;
+    }
+    const takeover = params.get("takeover") === "1";
+    const role = params.get("verify") === "1" ? "verify" : "real";
+    if (this.client && this.client.readyState !== 1) {
+      this.releaseIncumbent();
+    }
+    if (this.client) {
+      if (this.clientRole === "real") {
+        if (role === "real" && takeover) {
+          this.detachIncumbent(
+            CLOSE_CODE_SUPERSEDED_BY_TAKEOVER,
+            CLOSE_REASON_SUPERSEDED_BY_TAKEOVER
+          );
+        } else {
+          this.rejectBusy(ws);
+          return;
+        }
+      } else {
+        if (role === "real") {
+          this.detachIncumbent(CLOSE_CODE_VERIFIER_PREEMPTED, CLOSE_REASON_VERIFIER_PREEMPTED);
+        } else {
+          this.rejectBusy(ws);
+          return;
+        }
+      }
+    }
+    this.attach(ws, role);
+  }
+  handleProbe(ws) {
+    ws.on("error", () => {
+    });
+    if (this.options.probeState) {
+      try {
+        ws.send(JSON.stringify(this.options.probeState()));
+      } catch {
+      }
+    }
+    ws.close(1e3);
+  }
+  rejectBusy(ws) {
+    ws.on("error", () => {
+    });
+    ws.close(CLOSE_CODE_CLIENT_BUSY, CLOSE_REASON_CLIENT_BUSY);
+  }
+  /** Release the incumbent from the slot: strip its 'message' listener so a
+   *  superseded/detached socket can never inject another frame, null the slot,
+   *  and fire its role-appropriate disconnect callback synchronously. Returns
+   *  the released socket so callers may close it with a chosen code. The
+   *  socket's own 'close' handler is a no-op afterwards (client no longer === ws). */
+  releaseIncumbent() {
+    const incumbent = this.client;
+    const incumbentRole = this.clientRole;
+    this.client = null;
+    this.clientRole = null;
+    incumbent?.removeAllListeners("message");
+    if (incumbentRole === "real") {
+      this.callbacks.onClientDisconnected?.();
+    } else if (incumbentRole === "verify") {
+      this.callbacks.onVerifierDisconnected?.();
+    }
+    return incumbent;
+  }
+  /** Detach the incumbent connection deliberately (takeover/preemption): release
+   *  it from the slot, then close its socket with the given application code. */
+  detachIncumbent(code, reason) {
+    this.releaseIncumbent()?.close(code, reason);
+  }
+  attach(ws, role) {
+    ws.on("message", (data, isBinary) => {
+      if (this.client !== ws) return;
+      if (role !== "real") return;
+      if (isBinary) {
+        if (this._buffering) {
+          this.audioBuffer.push(data);
+        } else {
+          this.callbacks.onAudioFromClient?.(data);
+        }
+      } else {
+        try {
+          const message = JSON.parse(data.toString());
+          this.callbacks.onJsonFromClient?.(message);
+        } catch {
+        }
+      }
+    });
+    ws.on("close", () => {
+      if (this.client !== ws) return;
+      this.client = null;
+      this.clientRole = null;
+      if (role === "real") {
+        this.callbacks.onClientDisconnected?.();
+      } else {
+        this.callbacks.onVerifierDisconnected?.();
+      }
+    });
+    ws.on("error", () => {
+    });
+    this.client = ws;
+    this.clientRole = role;
+    if (role === "real") {
+      this.callbacks.onClientConnected?.();
+    } else {
+      this.callbacks.onVerifierConnected?.();
+    }
   }
   async stop() {
     this._buffering = false;
@@ -2103,6 +2200,7 @@ var ClientTransport = class {
       this.client.removeAllListeners();
       this.client.close();
       this.client = null;
+      this.clientRole = null;
     }
     if (this.wss) {
       return new Promise((resolve) => {
@@ -2133,8 +2231,18 @@ var ClientTransport = class {
     this._buffering = false;
     return this.audioBuffer.drain();
   }
+  /** True when a REAL client is attached and open. Verifier and probe
+   *  connections never count (client accounting is real-clients-only). */
   get isClientConnected() {
-    return this.client?.readyState === 1;
+    return this.clientRole === "real" && this.client?.readyState === 1;
+  }
+  /** True when a verification-role (`?verify=1`) connection is attached and open. */
+  get isVerifierConnected() {
+    return this.clientRole === "verify" && this.client?.readyState === 1;
+  }
+  /** Role of the currently attached connection, or null when none. */
+  get attachedRole() {
+    return this.client ? this.clientRole : null;
   }
   get buffering() {
     return this._buffering;
@@ -3241,9 +3349,13 @@ var VoiceSession = class _VoiceSession {
         onAudioFromClient: (data) => this.handleAudioFromClient(data),
         onJsonFromClient: (message) => this.handleJsonFromClient(message),
         onClientConnected: () => this.handleClientConnected(),
-        onClientDisconnected: () => this.handleClientDisconnected()
+        onClientDisconnected: () => this.handleClientDisconnected(),
+        onVerifierConnected: config.onVerifierConnected,
+        onVerifierDisconnected: config.onVerifierDisconnected
       },
-      config.host ?? "0.0.0.0"
+      config.host ?? "0.0.0.0",
+      void 0,
+      { probeState: config.probeState }
     );
     this.eventBus.subscribe("gui.update", (payload) => {
       this.clientTransport.sendJsonToClient({ type: "gui.update", payload });
@@ -4736,6 +4848,12 @@ export {
   AgentRouter,
   AudioBuffer,
   BackgroundNotificationQueue,
+  CLOSE_CODE_CLIENT_BUSY,
+  CLOSE_CODE_SUPERSEDED_BY_TAKEOVER,
+  CLOSE_CODE_VERIFIER_PREEMPTED,
+  CLOSE_REASON_CLIENT_BUSY,
+  CLOSE_REASON_SUPERSEDED_BY_TAKEOVER,
+  CLOSE_REASON_VERIFIER_PREEMPTED,
   CancelledError,
   ClientTransport,
   ConversationContext,

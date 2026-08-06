@@ -1001,13 +1001,42 @@ interface ClientTransportCallbacks {
     onAudioFromClient?(data: Buffer): void;
     /** A JSON message received from the client WebSocket (text frames). */
     onJsonFromClient?(message: Record<string, unknown>): void;
-    /** A client WebSocket connection was established. */
+    /** A REAL client WebSocket connection was established (never fired for probe/verify roles). */
     onClientConnected?(): void;
-    /** The client WebSocket disconnected. */
+    /** The REAL client WebSocket disconnected (never fired for probe/verify roles). */
     onClientDisconnected?(): void;
     /** An image was uploaded by the client (base64-encoded). */
     onImageUpload?(imageBase64: string, mimeType: string): void;
+    /** A verification-role connection (`?verify=1`) attached. The embedder may use
+     *  this narrow hook to wake upstream, but MUST NOT run real-client
+     *  connect side effects here (Y3 behavioral isolation). */
+    onVerifierConnected?(): void;
+    /** The verification-role connection detached (clean close or preemption). */
+    onVerifierDisconnected?(): void;
 }
+/** Optional constructor behavior for ClientTransport. */
+interface ClientTransportOptions {
+    /** Supplies the JSON state frame sent to `?probe=1` connections. When absent,
+     *  probes are upgraded and closed (code 1000) without a frame (L1-only probe). */
+    probeState?: () => object;
+}
+/** Connection roles recognized from the request URL query (owner-decided mechanism, 2026-08-05). */
+type ClientConnectionRole = 'real' | 'verify';
+/** Application close code: a second real client (or a verifier) was rejected
+ *  because a real client is attached (V4/W5). */
+declare const CLOSE_CODE_CLIENT_BUSY = 4409;
+/** Close reason paired with {@link CLOSE_CODE_CLIENT_BUSY}. */
+declare const CLOSE_REASON_CLIENT_BUSY = "client-busy";
+/** Application close code: the incumbent real client was closed because a
+ *  `?takeover=1` challenger completed the user-confirmed takeover handshake (W5). */
+declare const CLOSE_CODE_SUPERSEDED_BY_TAKEOVER = 4410;
+/** Close reason paired with {@link CLOSE_CODE_SUPERSEDED_BY_TAKEOVER}. */
+declare const CLOSE_REASON_SUPERSEDED_BY_TAKEOVER = "superseded-by-takeover";
+/** Application close code: an incumbent verification-role connection was
+ *  preempted by an arriving real client (X2) — the verifier's owner requeues. */
+declare const CLOSE_CODE_VERIFIER_PREEMPTED = 4411;
+/** Close reason paired with {@link CLOSE_CODE_VERIFIER_PREEMPTED}. */
+declare const CLOSE_REASON_VERIFIER_PREEMPTED = "verifier-preempted";
 /**
  * WebSocket server that bridges a client audio app to the framework.
  *
@@ -1017,18 +1046,47 @@ interface ClientTransportCallbacks {
  *
  * Buffering mode (`startBuffering`/`stopBuffering`) only affects binary audio frames.
  * Text frames are always delivered immediately.
+ *
+ * Pre-client interception (owner-decided mechanism, 2026-08-05) — recognized
+ * from the upgrade request URL query, BEFORE any `client` assignment:
+ * - `?probe=1` — health probe: upgrade completes, one JSON text frame from
+ *   `options.probeState` is sent (if provided), then close 1000. Probe sockets
+ *   never touch the attached client, never fire connect/disconnect callbacks,
+ *   and are excluded from all client accounting.
+ * - `?takeover=1` — user-confirmed takeover: an incumbent real client is closed
+ *   with 4410 `superseded-by-takeover`, then the challenger attaches as real.
+ * - `?verify=1` — low-priority verification role: rejected 4409 `client-busy`
+ *   while a real client is attached; preempted (4411 `verifier-preempted`) when
+ *   a real client arrives. Fires `onVerifierConnected`/`onVerifierDisconnected`
+ *   only — never the real-client callbacks — and never counts as attached.
  */
 declare class ClientTransport {
     private port;
     private callbacks;
     private host;
     private listenTimeoutMs;
+    private options;
     private wss;
     private client;
+    private clientRole;
     private audioBuffer;
     private _buffering;
-    constructor(port: number, callbacks: ClientTransportCallbacks, host?: string, listenTimeoutMs?: number);
+    constructor(port: number, callbacks: ClientTransportCallbacks, host?: string, listenTimeoutMs?: number, options?: ClientTransportOptions);
     start(): Promise<void>;
+    /** Pre-client interception: classify the connection BEFORE any `client` assignment. */
+    private handleConnection;
+    private handleProbe;
+    private rejectBusy;
+    /** Release the incumbent from the slot: strip its 'message' listener so a
+     *  superseded/detached socket can never inject another frame, null the slot,
+     *  and fire its role-appropriate disconnect callback synchronously. Returns
+     *  the released socket so callers may close it with a chosen code. The
+     *  socket's own 'close' handler is a no-op afterwards (client no longer === ws). */
+    private releaseIncumbent;
+    /** Detach the incumbent connection deliberately (takeover/preemption): release
+     *  it from the slot, then close its socket with the given application code. */
+    private detachIncumbent;
+    private attach;
     stop(): Promise<void>;
     /** Send raw PCM audio to the client as a binary frame. */
     sendAudioToClient(data: Buffer): void;
@@ -1036,7 +1094,13 @@ declare class ClientTransport {
     sendJsonToClient(message: Record<string, unknown>): void;
     startBuffering(): void;
     stopBuffering(): Buffer[];
+    /** True when a REAL client is attached and open. Verifier and probe
+     *  connections never count (client accounting is real-clients-only). */
     get isClientConnected(): boolean;
+    /** True when a verification-role (`?verify=1`) connection is attached and open. */
+    get isVerifierConnected(): boolean;
+    /** Role of the currently attached connection, or null when none. */
+    get attachedRole(): ClientConnectionRole | null;
     get buffering(): boolean;
 }
 
@@ -1952,6 +2016,18 @@ interface VoiceSessionConfig {
      *  overlapped user speech — a deliberate per-deployment choice); env
      *  BODHI_ECHO_GUARD=0 hard-disables. */
     echoGuard?: EchoGuardConfig;
+    /** Supplies the JSON state frame sent to `?probe=1` health-probe connections
+     *  on the client WebSocket server. When absent, probes are upgraded and
+     *  closed (code 1000) without a frame. Probe sockets never attach as the
+     *  client and never fire connect/disconnect handling. */
+    probeState?: () => object;
+    /** A verification-role (`?verify=1`) connection attached. Narrow hook for
+     *  embedders (e.g. to wake upstream); real-client connect side effects
+     *  (greeting, context replay, clientConnected accounting) never run for it. */
+    onVerifierConnected?: () => void;
+    /** The verification-role connection detached (clean close or preemption by
+     *  an arriving real client). */
+    onVerifierDisconnected?: () => void;
 }
 /**
  * Top-level integration hub that wires all framework components together.
@@ -2592,4 +2668,4 @@ interface QueuedNotification {
     queuedAt: number;
 }
 
-export { AUDIO_FORMAT, type AgentContext, AgentError, AgentRouter, AudioBuffer, type AudioFormat, type AudioFormatSpec, BackgroundNotificationQueue, type BehaviorCategory, type BehaviorPreset, CancelledError, type ClientMessage, ClientTransport, type ClientTransportCallbacks, type ContentTurn, ConversationContext, type ConversationHistoryStore, ConversationHistoryWriter, type ConversationItem, type ConversationItemRole, DEFAULT_CONNECT_TIMEOUT_MS, DEFAULT_EXTRACTION_TIMEOUT_MS, DEFAULT_RECONNECT_TIMEOUT_MS, DEFAULT_SUBAGENT_TIMEOUT_MS, DEFAULT_TOOL_TIMEOUT_MS, DirectiveManager, type EchoCheckResult, type EchoEnvEntry, EchoGuard, type EchoGuardConfig, type ElevenLabsSTTConfig, ElevenLabsSTTProvider, type ErrorSeverity, EventBus, type EventHandler, type EventPayload, type EventPayloadMap, type EventSourceConfig, type EventType, type ExternalEvent, FrameworkError, type FrameworkHooks, type GeminiBatchSTTConfig, GeminiBatchSTTProvider, GeminiLiveTransport, type GeminiTransportCallbacks, type GeminiTransportConfig, HooksManager, type IEventBus, InMemorySessionStore, InputTimeoutError, InteractionModeManager, type InteractiveSubagentConfig, JsonMemoryStore, type LLMTransport, type LLMTransportConfig, type LLMTransportError, type MainAgent, MemoryCacheManager, type MemoryCategory, MemoryDistiller, type MemoryDistillerConfig, MemoryError, type MemoryFact, type MemoryStore, type NotificationPriority, type OpenAIRealtimeConfig, OpenAIRealtimeTransport, type PaginationOptions, type PendingToolCall, type QueuedNotification, type ReconnectState, type ReplayItem, type ResumptionState, type ResumptionUpdate, type RunSubagentOptions, type STTAudioConfig, type STTProvider, type SendOrQueueOptions, type ServiceSubagentConfig, type SessionAnalytics, type SessionCheckpoint, SessionCompletedError, type SessionConfig, SessionError, type SessionInteractionMode, SessionManager, type SessionRecord, type SessionReport, type SessionState, type SessionStore, type SessionSummary, type SessionUpdate, type SubagentConfig, type SubagentContextSnapshot, type SubagentEventCallbacks, type SubagentMessage, type SubagentResult, type SubagentSession, SubagentSessionImpl, type SubagentSessionState, type SubagentTask, type ToolCall, ToolCallRouter, type ToolCallRouterDeps, type ToolContext, type ToolDefinition, type ToolExecution, ToolExecutionError, ToolExecutor, type ToolResult, TranscriptManager, type TranscriptSink, type TransportAuth, type TransportCapabilities, TransportError, type TransportPendingToolCall, type TransportToolCall, type TransportToolResult, type UIPayload, type UIResponse, type Unsubscribe, ValidationError, VoiceSession, type VoiceSessionConfig, bestEnvelopeLag, createAgentContext, createAskUserTool, envelopePearson, runSubagent, zodToJsonSchema };
+export { AUDIO_FORMAT, type AgentContext, AgentError, AgentRouter, AudioBuffer, type AudioFormat, type AudioFormatSpec, BackgroundNotificationQueue, type BehaviorCategory, type BehaviorPreset, CLOSE_CODE_CLIENT_BUSY, CLOSE_CODE_SUPERSEDED_BY_TAKEOVER, CLOSE_CODE_VERIFIER_PREEMPTED, CLOSE_REASON_CLIENT_BUSY, CLOSE_REASON_SUPERSEDED_BY_TAKEOVER, CLOSE_REASON_VERIFIER_PREEMPTED, CancelledError, type ClientConnectionRole, type ClientMessage, ClientTransport, type ClientTransportCallbacks, type ClientTransportOptions, type ContentTurn, ConversationContext, type ConversationHistoryStore, ConversationHistoryWriter, type ConversationItem, type ConversationItemRole, DEFAULT_CONNECT_TIMEOUT_MS, DEFAULT_EXTRACTION_TIMEOUT_MS, DEFAULT_RECONNECT_TIMEOUT_MS, DEFAULT_SUBAGENT_TIMEOUT_MS, DEFAULT_TOOL_TIMEOUT_MS, DirectiveManager, type EchoCheckResult, type EchoEnvEntry, EchoGuard, type EchoGuardConfig, type ElevenLabsSTTConfig, ElevenLabsSTTProvider, type ErrorSeverity, EventBus, type EventHandler, type EventPayload, type EventPayloadMap, type EventSourceConfig, type EventType, type ExternalEvent, FrameworkError, type FrameworkHooks, type GeminiBatchSTTConfig, GeminiBatchSTTProvider, GeminiLiveTransport, type GeminiTransportCallbacks, type GeminiTransportConfig, HooksManager, type IEventBus, InMemorySessionStore, InputTimeoutError, InteractionModeManager, type InteractiveSubagentConfig, JsonMemoryStore, type LLMTransport, type LLMTransportConfig, type LLMTransportError, type MainAgent, MemoryCacheManager, type MemoryCategory, MemoryDistiller, type MemoryDistillerConfig, MemoryError, type MemoryFact, type MemoryStore, type NotificationPriority, type OpenAIRealtimeConfig, OpenAIRealtimeTransport, type PaginationOptions, type PendingToolCall, type QueuedNotification, type ReconnectState, type ReplayItem, type ResumptionState, type ResumptionUpdate, type RunSubagentOptions, type STTAudioConfig, type STTProvider, type SendOrQueueOptions, type ServiceSubagentConfig, type SessionAnalytics, type SessionCheckpoint, SessionCompletedError, type SessionConfig, SessionError, type SessionInteractionMode, SessionManager, type SessionRecord, type SessionReport, type SessionState, type SessionStore, type SessionSummary, type SessionUpdate, type SubagentConfig, type SubagentContextSnapshot, type SubagentEventCallbacks, type SubagentMessage, type SubagentResult, type SubagentSession, SubagentSessionImpl, type SubagentSessionState, type SubagentTask, type ToolCall, ToolCallRouter, type ToolCallRouterDeps, type ToolContext, type ToolDefinition, type ToolExecution, ToolExecutionError, ToolExecutor, type ToolResult, TranscriptManager, type TranscriptSink, type TransportAuth, type TransportCapabilities, TransportError, type TransportPendingToolCall, type TransportToolCall, type TransportToolResult, type UIPayload, type UIResponse, type Unsubscribe, ValidationError, VoiceSession, type VoiceSessionConfig, bestEnvelopeLag, createAgentContext, createAskUserTool, envelopePearson, runSubagent, zodToJsonSchema };
