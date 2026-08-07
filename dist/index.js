@@ -2394,6 +2394,18 @@ var GeminiLiveTransport = class {
   setupResolver = null;
   /** Tracks whether onModelTurnStart has already fired for the current turn. */
   _modelTurnStarted = false;
+  /** Connection generation — bumped on every connect() AND disconnect().
+   * Each socket's callbacks capture their generation; events from a
+   * superseded socket are dropped. Root cause (Sutando live, 2026-08-07):
+   * during a rotation the old WebSocket lingered (the "client failed to
+   * close after GoAway" 1008 class) while the new one connected — BOTH
+   * fed handleMessage, and two generations' tokens were interleaved into
+   * ONE model turn (sqlite row literally reads "…targeted terms, orHi,
+   * I'm we can look at Lucy, specific your sources Sutando…"). Fencing
+   * also drops a superseded socket's late onclose, which otherwise
+   * cascaded extra reconnect cycles. */
+  _connGen = 0;
+  _staleDropLoggedGen = -1;
   // --- LLMTransport static properties ---
   capabilities = {
     messageTruncation: false,
@@ -2487,19 +2499,34 @@ var GeminiLiveTransport = class {
         automaticActivityDetection: this.config.vadConfig
       };
     }
+    const _gen = ++this._connGen;
     this.session = await this.ai.live.connect({
       model,
       config: connectConfig,
       callbacks: {
         onopen: () => {
         },
-        onmessage: (msg) => this.handleMessage(msg),
+        onmessage: (msg) => {
+          if (_gen !== this._connGen) {
+            if (this._staleDropLoggedGen !== _gen) {
+              this._staleDropLoggedGen = _gen;
+              console.warn(`[GeminiLiveTransport] dropping message(s) from superseded connection gen=${_gen} (current=${this._connGen}) \u2014 stream fence`);
+            }
+            return;
+          }
+          this.handleMessage(msg);
+        },
         onerror: (e) => {
+          if (_gen !== this._connGen) return;
           const error = new Error(e.message ?? "WebSocket error");
           this.callbacks.onError?.(error);
           if (this.onError) this.onError({ error, recoverable: true });
         },
         onclose: (e) => {
+          if (_gen !== this._connGen) {
+            console.warn(`[GeminiLiveTransport] suppressed close event from superseded connection gen=${_gen} (code=${e?.code})`);
+            return;
+          }
           const code = e?.code;
           const reason = e?.reason;
           this.callbacks.onClose?.(code, reason);
@@ -2540,6 +2567,7 @@ var GeminiLiveTransport = class {
   }
   async disconnect() {
     this._modelTurnStarted = false;
+    this._connGen++;
     if (this.session) {
       try {
         await this.session.close();

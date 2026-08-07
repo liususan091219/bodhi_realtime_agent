@@ -2351,6 +2351,18 @@ declare class GeminiLiveTransport implements LLMTransport {
     private setupResolver;
     /** Tracks whether onModelTurnStart has already fired for the current turn. */
     private _modelTurnStarted;
+    /** Connection generation — bumped on every connect() AND disconnect().
+     * Each socket's callbacks capture their generation; events from a
+     * superseded socket are dropped. Root cause (Sutando live, 2026-08-07):
+     * during a rotation the old WebSocket lingered (the "client failed to
+     * close after GoAway" 1008 class) while the new one connected — BOTH
+     * fed handleMessage, and two generations' tokens were interleaved into
+     * ONE model turn (sqlite row literally reads "…targeted terms, orHi,
+     * I'm we can look at Lucy, specific your sources Sutando…"). Fencing
+     * also drops a superseded socket's late onclose, which otherwise
+     * cascaded extra reconnect cycles. */
+    private _connGen;
+    private _staleDropLoggedGen;
     readonly capabilities: TransportCapabilities;
     readonly audioFormat: AudioFormatSpec;
     onAudioOutput?: (base64Data: string) => void;
