@@ -493,6 +493,16 @@ var AgentRouter = class {
     this.extraTools = extraTools;
     this.subagentCallbacks = subagentCallbacks;
   }
+  sessionManager;
+  eventBus;
+  hooks;
+  conversationContext;
+  transport;
+  clientTransport;
+  model;
+  getInstructionSuffix;
+  extraTools;
+  subagentCallbacks;
   agents = /* @__PURE__ */ new Map();
   _activeAgent = null;
   activeSubagents = /* @__PURE__ */ new Map();
@@ -683,6 +693,9 @@ var BackgroundNotificationQueue = class {
     this.log = log;
     this.messageTruncation = messageTruncation;
   }
+  sendContent;
+  log;
+  messageTruncation;
   queue = [];
   audioReceived = false;
   interrupted = false;
@@ -1070,6 +1083,12 @@ var ConversationHistoryWriter = class {
     this.store = store;
     this.subscribe();
   }
+  sessionId;
+  userId;
+  initialAgentName;
+  eventBus;
+  conversationContext;
+  store;
   unsubscribers = [];
   analytics = {
     turnCount: 0,
@@ -1177,6 +1196,8 @@ var SessionManager = class {
     this.userId = config.userId;
     this.initialAgent = config.initialAgent;
   }
+  eventBus;
+  hooks;
   _state = "CREATED";
   _resumptionHandle = null;
   _bufferedMessages = [];
@@ -1294,6 +1315,8 @@ var MemoryCacheManager = class {
     this.store = store;
     this.userId = userId;
   }
+  store;
+  userId;
   cache = [];
   /** Reload cached facts from the store. Best-effort: keeps stale cache on failure. */
   async refresh() {
@@ -1469,6 +1492,7 @@ var TranscriptManager = class {
   constructor(sink) {
     this.sink = sink;
   }
+  sink;
   inputBuffer = "";
   outputBuffer = "";
   /** Pre-tool-call output text, saved when a tool call splits a turn. */
@@ -1763,6 +1787,10 @@ var MemoryDistiller = class {
     this.turnFrequency = config.turnFrequency ?? 5;
     this.extractionTimeoutMs = config.extractionTimeoutMs ?? DEFAULT_EXTRACTION_TIMEOUT_MS;
   }
+  conversationContext;
+  memoryStore;
+  hooks;
+  model;
   turnCount = 0;
   extractionInFlight = false;
   turnFrequency;
@@ -1856,6 +1884,12 @@ var ToolExecutor = class {
     this.sendJsonToClient = sendJsonToClient;
     this.setDirective = setDirective;
   }
+  hooks;
+  eventBus;
+  sessionId;
+  agentName;
+  sendJsonToClient;
+  setDirective;
   tools = /* @__PURE__ */ new Map();
   pending = /* @__PURE__ */ new Map();
   register(tools) {
@@ -2062,6 +2096,11 @@ var ClientTransport = class {
     this.listenTimeoutMs = listenTimeoutMs;
     this.options = options;
   }
+  port;
+  callbacks;
+  host;
+  listenTimeoutMs;
+  options;
   wss = null;
   client = null;
   clientRole = null;
@@ -2500,6 +2539,9 @@ var GeminiLiveTransport = class {
   config;
   /** Resolves when setupComplete fires — used to make connect() await Gemini readiness. */
   setupResolver = null;
+  /** Increments per dial; callbacks capture their dial's value so a
+   *  superseded dial's socket events never reach the live handlers. */
+  dialGen = 0;
   /** Tracks whether onModelTurnStart has already fired for the current turn. */
   _modelTurnStarted = false;
   // --- LLMTransport static properties ---
@@ -2595,26 +2637,6 @@ var GeminiLiveTransport = class {
         automaticActivityDetection: this.config.vadConfig
       };
     }
-    this.session = await this.ai.live.connect({
-      model,
-      config: connectConfig,
-      callbacks: {
-        onopen: () => {
-        },
-        onmessage: (msg) => this.handleMessage(msg),
-        onerror: (e) => {
-          const error = new Error(e.message ?? "WebSocket error");
-          this.callbacks.onError?.(error);
-          if (this.onError) this.onError({ error, recoverable: true });
-        },
-        onclose: (e) => {
-          const code = e?.code;
-          const reason = e?.reason;
-          this.callbacks.onClose?.(code, reason);
-          if (this.onClose) this.onClose(code, reason);
-        }
-      }
-    });
     const timeoutMs = this.config.connectTimeoutMs ?? DEFAULT_CONNECT_TIMEOUT_MS;
     let timer;
     const timeout = new Promise((_, reject) => {
@@ -2623,7 +2645,43 @@ var GeminiLiveTransport = class {
         timeoutMs
       );
     });
-    await Promise.race([setupComplete, timeout]).finally(() => clearTimeout(timer));
+    const gen = ++this.dialGen;
+    const dial = this.ai.live.connect({
+      model,
+      config: connectConfig,
+      callbacks: {
+        onopen: () => {
+        },
+        onmessage: (msg) => {
+          if (gen !== this.dialGen) return;
+          this.handleMessage(msg);
+        },
+        onerror: (e) => {
+          if (gen !== this.dialGen) return;
+          const error = new Error(e.message ?? "WebSocket error");
+          this.callbacks.onError?.(error);
+          if (this.onError) this.onError({ error, recoverable: true });
+        },
+        onclose: (e) => {
+          if (gen !== this.dialGen) return;
+          const code = e?.code;
+          const reason = e?.reason;
+          this.callbacks.onClose?.(code, reason);
+          if (this.onClose) this.onClose(code, reason);
+        }
+      }
+    });
+    try {
+      this.session = await Promise.race([dial, timeout]);
+      await Promise.race([setupComplete, timeout]);
+    } catch (err) {
+      if (gen === this.dialGen) this.dialGen++;
+      dial.then((s) => s?.close?.()).catch(() => {
+      });
+      throw err;
+    } finally {
+      clearTimeout(timer);
+    }
   }
   /** Disconnect and reconnect, optionally with a new resumption handle or ReconnectState.
    *  Accepts either a string handle (legacy API) or ReconnectState (LLMTransport API).
@@ -3137,6 +3195,9 @@ var VoiceSession = class _VoiceSession {
    *  the CONNECTING state alone doesn't tell handleSetupComplete that
    *  this is a reconnect (vs. an initial connect). */
   _skipNextGreeting = false;
+  /** Increments per client-connect dial; a close during CONNECTING bumps it
+   *  so the abandoned dial's then/catch handlers recognize themselves stale. */
+  _dialGen = 0;
   /** Whether a browser client is currently connected via WebSocket. */
   get clientConnected() {
     return this._clientConnected;
@@ -3778,11 +3839,16 @@ ${recent}`
       this.sessionManager.reset();
       this.sessionManager.transitionTo("CONNECTING");
       this._skipNextGreeting = true;
+      const dialGen = ++this._dialGen;
       const connectPromise = this.config.transport ? this.transport.connect() : this.transport.connect({
         auth: { type: "api_key", apiKey: this.config.apiKey },
         model: this.config.geminiModel ?? "gemini-live-2.5-flash-preview"
       });
       connectPromise.then(() => {
+        if (dialGen !== this._dialGen) {
+          this.log("Stale Gemini dial resolved after recovery \u2014 ignoring");
+          return;
+        }
         this.log("Gemini reconnected for client");
         const items = this.conversationContext.items;
         const recentMessages = items.filter((item) => item.role === "user" || item.role === "assistant").slice(-10).map((item) => `${item.role}: ${item.content.slice(0, 150)}`).join("\n");
@@ -3800,6 +3866,12 @@ ${recentMessages}`
           this.log("Injected conversation context on Gemini reconnect (silent)");
         }
       }).catch((err) => {
+        if (dialGen !== this._dialGen || this.sessionManager.state !== "CONNECTING") {
+          this.log(
+            `Stale Gemini dial rejected after recovery \u2014 ignoring (${err instanceof Error ? err.message : err})`
+          );
+          return;
+        }
         this.log(`Gemini reconnect failed: ${err instanceof Error ? err.message : err}`);
         this.reportError(
           "reconnect-on-client",
@@ -3833,6 +3905,12 @@ ${recentMessages}`
       );
       return;
     }
+    if (this.sessionManager.state === "CONNECTING") {
+      this._dialGen++;
+      this.log("Transport closed during CONNECTING \u2014 dial failed; back to CLOSED for redial");
+      this.sessionManager.transitionTo("CLOSED");
+      return;
+    }
   }
   reportError(component, error) {
     const err = error instanceof Error ? error : new Error(String(error));
@@ -3861,6 +3939,7 @@ var JsonMemoryStore = class {
   constructor(baseDir) {
     this.baseDir = baseDir;
   }
+  baseDir;
   async addFacts(userId, facts) {
     if (facts.length === 0) return;
     const filePath = this.filePath(userId);

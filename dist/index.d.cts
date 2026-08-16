@@ -2094,6 +2094,9 @@ declare class VoiceSession {
      *  the CONNECTING state alone doesn't tell handleSetupComplete that
      *  this is a reconnect (vs. an initial connect). */
     private _skipNextGreeting;
+    /** Increments per client-connect dial; a close during CONNECTING bumps it
+     *  so the abandoned dial's then/catch handlers recognize themselves stale. */
+    private _dialGen;
     /** Whether a browser client is currently connected via WebSocket. */
     get clientConnected(): boolean;
     private notificationQueue;
@@ -2425,6 +2428,9 @@ declare class GeminiLiveTransport implements LLMTransport {
     private config;
     /** Resolves when setupComplete fires — used to make connect() await Gemini readiness. */
     private setupResolver;
+    /** Increments per dial; callbacks capture their dial's value so a
+     *  superseded dial's socket events never reach the live handlers. */
+    private dialGen;
     /** Tracks whether onModelTurnStart has already fired for the current turn. */
     private _modelTurnStarted;
     readonly capabilities: TransportCapabilities;

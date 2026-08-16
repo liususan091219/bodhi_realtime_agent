@@ -193,6 +193,9 @@ export class VoiceSession {
 	 *  the CONNECTING state alone doesn't tell handleSetupComplete that
 	 *  this is a reconnect (vs. an initial connect). */
 	private _skipNextGreeting = false;
+	/** Increments per client-connect dial; a close during CONNECTING bumps it
+	 *  so the abandoned dial's then/catch handlers recognize themselves stale. */
+	private _dialGen = 0;
 	/** Whether a browser client is currently connected via WebSocket. */
 	get clientConnected(): boolean {
 		return this._clientConnected;
@@ -1109,6 +1112,7 @@ export class VoiceSession {
 			this.sessionManager.reset();
 			this.sessionManager.transitionTo('CONNECTING');
 			this._skipNextGreeting = true;
+			const dialGen = ++this._dialGen;
 			const connectPromise = this.config.transport
 				? this.transport.connect()
 				: this.transport.connect({
@@ -1117,6 +1121,10 @@ export class VoiceSession {
 					});
 			connectPromise
 				.then(() => {
+					if (dialGen !== this._dialGen) {
+						this.log('Stale Gemini dial resolved after recovery — ignoring');
+						return;
+					}
 					this.log('Gemini reconnected for client');
 					// Build a condensed context from conversation history
 					const items = this.conversationContext.items;
@@ -1151,6 +1159,12 @@ export class VoiceSession {
 					}
 				})
 				.catch((err) => {
+					if (dialGen !== this._dialGen || this.sessionManager.state !== 'CONNECTING') {
+						this.log(
+							`Stale Gemini dial rejected after recovery — ignoring (${err instanceof Error ? err.message : err})`,
+						);
+						return;
+					}
 					this.log(`Gemini reconnect failed: ${err instanceof Error ? err.message : err}`);
 					this.reportError(
 						'reconnect-on-client',
@@ -1197,6 +1211,15 @@ export class VoiceSession {
 			this.log(
 				'Transport close during RECONNECTING — state left unchanged, awaiting reconnect promise',
 			);
+			return;
+		}
+		if (this.sessionManager.state === 'CONNECTING') {
+			// A dial whose socket died (DNS failure, refused, dropped). The SDK's
+			// connect promise may never settle, so this close is the only signal —
+			// go back to CLOSED so the next client connect redials.
+			this._dialGen++;
+			this.log('Transport closed during CONNECTING — dial failed; back to CLOSED for redial');
+			this.sessionManager.transitionTo('CLOSED');
 			return;
 		}
 	}
