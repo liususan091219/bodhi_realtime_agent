@@ -1481,6 +1481,164 @@ describe('VoiceSession', () => {
 			expect(session.sessionManager.state).toBe('CLOSED');
 			expect(onError).not.toHaveBeenCalled();
 		});
+
+		it('recovers to CLOSED when the transport closes mid-dial, so the next client connect redials', async () => {
+			// Incident shape: the client-connect redial's socket dies (getaddrinfo
+			// ENOTFOUND → error + close) while the SDK's resolve-only connect
+			// promise never settles. Without a CONNECTING branch in
+			// handleTransportClose the session wedges in CONNECTING forever and
+			// every later client connect is a no-op.
+			session = new VoiceSession({
+				sessionId: 'sess_dial_close',
+				userId: 'user_1',
+				apiKey: 'test-key',
+				agents: [createEchoAgent()],
+				initialAgent: 'echo',
+				port: 9907,
+				model: mockModel,
+			});
+			const priv = session as unknown as {
+				handleTransportClose: (code?: number) => void;
+				handleClientConnected: () => void;
+				transport: { connect: () => Promise<void> };
+			};
+
+			await session.start();
+			await new Promise((r) => setTimeout(r, 50));
+
+			// Gemini drops (idle/GoAway aftermath) — the pre-incident resting state.
+			priv.handleTransportClose();
+			expect(session.sessionManager.state).toBe('CLOSED');
+
+			// Client connects; this dial hangs at the SDK layer forever.
+			const connectSpy = vi
+				.spyOn(priv.transport, 'connect')
+				.mockImplementation(() => new Promise(() => {}));
+			priv.handleClientConnected();
+			expect(session.sessionManager.state).toBe('CONNECTING');
+
+			// The dial's socket dies; only the close event reaches the session.
+			priv.handleTransportClose(1006);
+			expect(session.sessionManager.state).toBe('CLOSED');
+
+			// User toggles the voice panel — the session must actually redial.
+			connectSpy.mockRestore();
+			priv.handleClientConnected();
+			await new Promise((r) => setTimeout(r, 50));
+			expect(session.sessionManager.state).toBe('ACTIVE');
+		});
+
+		it('ignores a stale dial rejection after the close event already recovered the session', async () => {
+			// The abandoned dial's promise can still reject later (transport
+			// deadline, late socket error). That settlement belongs to a dead
+			// dial: it must not fire the reconnect-error path again, and it must
+			// not touch session state (CLOSED → CLOSED would throw; a newer dial
+			// mid-CONNECTING would be killed).
+			const onError = vi.fn();
+			session = new VoiceSession({
+				sessionId: 'sess_stale_reject',
+				userId: 'user_1',
+				apiKey: 'test-key',
+				agents: [createEchoAgent()],
+				initialAgent: 'echo',
+				port: 9908,
+				model: mockModel,
+				hooks: { onError },
+			});
+			const priv = session as unknown as {
+				handleTransportClose: (code?: number) => void;
+				handleClientConnected: () => void;
+				transport: { connect: () => Promise<void> };
+			};
+
+			await session.start();
+			await new Promise((r) => setTimeout(r, 50));
+			priv.handleTransportClose();
+			expect(session.sessionManager.state).toBe('CLOSED');
+
+			let rejectDial!: (err: Error) => void;
+			vi.spyOn(priv.transport, 'connect').mockImplementation(
+				() =>
+					new Promise((_, reject) => {
+						rejectDial = reject;
+					}),
+			);
+			priv.handleClientConnected();
+			expect(session.sessionManager.state).toBe('CONNECTING');
+
+			// Close recovers the session first…
+			priv.handleTransportClose(1006);
+			expect(session.sessionManager.state).toBe('CLOSED');
+
+			// …then the dead dial's promise finally rejects.
+			rejectDial(new Error('getaddrinfo ENOTFOUND generativelanguage.googleapis.com'));
+			await new Promise((r) => setTimeout(r, 10));
+
+			expect(session.sessionManager.state).toBe('CLOSED');
+			expect(onError).not.toHaveBeenCalledWith(
+				expect.objectContaining({ component: 'reconnect-on-client' }),
+			);
+		});
+
+		it('a stale dial resolving after recovery does not inject duplicate reconnect context', async () => {
+			// If the abandoned dial's promise RESOLVES late (socket opened after
+			// all), its then-handler must not inject the reconnect context again
+			// on top of the newer dial's injection — duplicate context replays are
+			// what the model acts on as phantom instructions.
+			session = new VoiceSession({
+				sessionId: 'sess_stale_resolve',
+				userId: 'user_1',
+				apiKey: 'test-key',
+				agents: [createEchoAgent()],
+				initialAgent: 'echo',
+				port: 9909,
+				model: mockModel,
+			});
+			const priv = session as unknown as {
+				handleTransportClose: (code?: number) => void;
+				handleClientConnected: () => void;
+				transport: {
+					connect: () => Promise<void>;
+					sendContent: (c: unknown, t: boolean) => void;
+				};
+				conversationContext: { addUserMessage: (t: string) => void };
+			};
+
+			await session.start();
+			await new Promise((r) => setTimeout(r, 50));
+			// Seed history so the reconnect path has context to inject.
+			priv.conversationContext.addUserMessage('hello there');
+			priv.handleTransportClose();
+			expect(session.sessionManager.state).toBe('CLOSED');
+
+			// Dial 1 hangs until we resolve it manually.
+			let resolveDial!: () => void;
+			const connectSpy = vi.spyOn(priv.transport, 'connect').mockImplementation(
+				() =>
+					new Promise((resolve) => {
+						resolveDial = resolve;
+					}),
+			);
+			priv.handleClientConnected();
+			priv.handleTransportClose(1006);
+			expect(session.sessionManager.state).toBe('CLOSED');
+
+			// Dial 2 succeeds normally and injects the reconnect context once.
+			connectSpy.mockRestore();
+			const sendSpy = vi.spyOn(priv.transport, 'sendContent');
+			priv.handleClientConnected();
+			await new Promise((r) => setTimeout(r, 50));
+			expect(session.sessionManager.state).toBe('ACTIVE');
+
+			// The dead dial finally resolves — must be recognized as stale.
+			resolveDial();
+			await new Promise((r) => setTimeout(r, 10));
+
+			const injections = sendSpy.mock.calls.filter((call) =>
+				JSON.stringify(call[0]).includes('You just reconnected'),
+			);
+			expect(injections).toHaveLength(1);
+		});
 	});
 
 	describe('background tool notification queuing', () => {

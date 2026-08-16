@@ -217,7 +217,19 @@ export class GeminiLiveTransport implements LLMTransport {
 			};
 		}
 
-		this.session = await this.ai.live.connect({
+		const timeoutMs = this.config.connectTimeoutMs ?? DEFAULT_CONNECT_TIMEOUT_MS;
+		let timer: ReturnType<typeof setTimeout> | undefined;
+		const timeout = new Promise<never>((_, reject) => {
+			timer = setTimeout(
+				() => reject(new Error(`Gemini connect timed out after ${timeoutMs}ms`)),
+				timeoutMs,
+			);
+		});
+
+		// The SDK's connect promise is resolve-only: on a failed dial (DNS
+		// failure, refused socket) it never settles — the deadline must cover
+		// the dial itself, not just the setupComplete wait.
+		const dial = this.ai.live.connect({
 			model,
 			config: connectConfig,
 			callbacks: {
@@ -237,15 +249,17 @@ export class GeminiLiveTransport implements LLMTransport {
 			},
 		});
 
-		const timeoutMs = this.config.connectTimeoutMs ?? DEFAULT_CONNECT_TIMEOUT_MS;
-		let timer: ReturnType<typeof setTimeout> | undefined;
-		const timeout = new Promise<never>((_, reject) => {
-			timer = setTimeout(
-				() => reject(new Error(`Gemini connect timed out after ${timeoutMs}ms`)),
-				timeoutMs,
-			);
-		});
-		await Promise.race([setupComplete, timeout]).finally(() => clearTimeout(timer));
+		try {
+			this.session = await Promise.race([dial, timeout]);
+			await Promise.race([setupComplete, timeout]);
+		} catch (err) {
+			// A dial that lost the race may still open later — close the orphan
+			// so an abandoned socket cannot linger.
+			dial.then((s) => s?.close?.()).catch(() => {});
+			throw err;
+		} finally {
+			clearTimeout(timer);
+		}
 	}
 
 	/** Disconnect and reconnect, optionally with a new resumption handle or ReconnectState.

@@ -171,6 +171,25 @@ describe('GeminiLiveTransport', () => {
 			const transport = new GeminiLiveTransport({ apiKey: 'test-key', connectTimeoutMs: 50 }, {});
 			await expect(transport.connect()).rejects.toThrow('timed out');
 		});
+
+		it(
+			'rejects with timeout when the SDK dial itself never settles (failed DNS/socket)',
+			{ timeout: 1000 },
+			async () => {
+				// live.connect()'s promise is resolve-only in the SDK — on a failed
+				// dial (getaddrinfo ENOTFOUND) it never settles, so the deadline must
+				// cover the dial, not just the setupComplete wait.
+				const { GoogleGenAI } = await import('@google/genai');
+				(GoogleGenAI as unknown as ReturnType<typeof vi.fn>).mockImplementationOnce(() => ({
+					live: {
+						connect: vi.fn(() => new Promise(() => {})),
+					},
+				}));
+
+				const transport = new GeminiLiveTransport({ apiKey: 'test-key', connectTimeoutMs: 50 }, {});
+				await expect(transport.connect()).rejects.toThrow('timed out');
+			},
+		);
 	});
 
 	describe('sendAudio', () => {
