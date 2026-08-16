@@ -2094,6 +2094,9 @@ declare class VoiceSession {
      *  the CONNECTING state alone doesn't tell handleSetupComplete that
      *  this is a reconnect (vs. an initial connect). */
     private _skipNextGreeting;
+    /** Increments per client-connect dial; a close during CONNECTING bumps it
+     *  so the abandoned dial's then/catch handlers recognize themselves stale. */
+    private _dialGen;
     /** Whether a browser client is currently connected via WebSocket. */
     get clientConnected(): boolean;
     private notificationQueue;
