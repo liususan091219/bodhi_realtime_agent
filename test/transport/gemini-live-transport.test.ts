@@ -190,6 +190,91 @@ describe('GeminiLiveTransport', () => {
 				await expect(transport.connect()).rejects.toThrow('timed out');
 			},
 		);
+
+		it('a superseded dial closing late does not fire the live onClose callback', async () => {
+			// Real-SDK shape: closing a session fires that dial's onclose. A dial
+			// abandoned by timeout is closed when it finally resolves; that stale
+			// close must not reach the session's handleTransportClose, which would
+			// mistake it for the CURRENT connection and tear down a healthy
+			// replacement.
+			const { GoogleGenAI } = await import('@google/genai');
+			let resolveDial1!: (s: unknown) => void;
+			let dial1Callbacks!: Record<string, (...args: unknown[]) => void>;
+			const connectFn = vi.fn();
+			(GoogleGenAI as unknown as ReturnType<typeof vi.fn>).mockImplementationOnce(() => ({
+				live: { connect: connectFn },
+			}));
+			connectFn
+				.mockImplementationOnce((params: Record<string, unknown>) => {
+					dial1Callbacks = params.callbacks as typeof dial1Callbacks;
+					return new Promise((resolve) => {
+						resolveDial1 = resolve;
+					});
+				})
+				// Dial 2 behaves like a healthy socket: session + its own setupComplete.
+				.mockImplementationOnce(async (params: Record<string, unknown>) => {
+					const cbs = params.callbacks as Record<string, (...args: unknown[]) => void>;
+					setTimeout(() => cbs.onmessage?.({ setupComplete: { sessionId: 'live_sid' } }), 1);
+					return mockSession;
+				});
+
+			const transport = new GeminiLiveTransport({ apiKey: 'test-key', connectTimeoutMs: 50 }, {});
+			const onCloseSpy = vi.fn();
+			transport.onClose = onCloseSpy;
+
+			// Dial 1 times out.
+			await expect(transport.connect()).rejects.toThrow('timed out');
+
+			// Dial 2 succeeds (default mock: resolves + fires setupComplete).
+			await transport.connect();
+			expect(transport.isConnected).toBe(true);
+
+			// Dial 1's socket finally opens; the transport closes the orphan and
+			// the SDK fires dial 1's onclose — as the real websocket would.
+			const dial1Session = {
+				close: vi.fn(() => dial1Callbacks.onclose?.({ code: 1000, reason: 'stale' })),
+			};
+			resolveDial1(dial1Session);
+			await new Promise((r) => setTimeout(r, 10));
+
+			expect(dial1Session.close).toHaveBeenCalled();
+			expect(onCloseSpy).not.toHaveBeenCalled();
+		});
+
+		it(
+			"a superseded dial's setupComplete cannot satisfy the current dial's setup wait",
+			{ timeout: 1000 },
+			async () => {
+				// setupResolver is per-connect state; a stale dial's late
+				// setupComplete must not resolve the replacement dial's wait.
+				const { GoogleGenAI } = await import('@google/genai');
+				let dial1Callbacks!: Record<string, (...args: unknown[]) => void>;
+				const connectFn = vi.fn();
+				(GoogleGenAI as unknown as ReturnType<typeof vi.fn>).mockImplementationOnce(() => ({
+					live: { connect: connectFn },
+				}));
+				connectFn
+					.mockImplementationOnce((params: Record<string, unknown>) => {
+						dial1Callbacks = params.callbacks as typeof dial1Callbacks;
+						return new Promise(() => {});
+					})
+					// Dial 2 resolves a session but its own setupComplete never fires.
+					.mockImplementationOnce(async () => mockSession);
+
+				const transport = new GeminiLiveTransport(
+					{ apiKey: 'test-key', connectTimeoutMs: 100 },
+					{},
+				);
+				await expect(transport.connect()).rejects.toThrow('timed out');
+
+				const secondDial = transport.connect();
+				// The stale dial's socket delivers a setupComplete mid-wait.
+				dial1Callbacks.onmessage?.({ setupComplete: { sessionId: 'stale_sid' } });
+
+				// Dial 2 must still time out — the stale ack proves nothing about it.
+				await expect(secondDial).rejects.toThrow('timed out');
+			},
+		);
 	});
 
 	describe('sendAudio', () => {

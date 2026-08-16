@@ -104,6 +104,9 @@ export class GeminiLiveTransport implements LLMTransport {
 	private config: GeminiTransportConfig;
 	/** Resolves when setupComplete fires — used to make connect() await Gemini readiness. */
 	private setupResolver: (() => void) | null = null;
+	/** Increments per dial; callbacks capture their dial's value so a
+	 *  superseded dial's socket events never reach the live handlers. */
+	private dialGen = 0;
 	/** Tracks whether onModelTurnStart has already fired for the current turn. */
 	private _modelTurnStarted = false;
 
@@ -229,18 +232,24 @@ export class GeminiLiveTransport implements LLMTransport {
 		// The SDK's connect promise is resolve-only: on a failed dial (DNS
 		// failure, refused socket) it never settles — the deadline must cover
 		// the dial itself, not just the setupComplete wait.
+		const gen = ++this.dialGen;
 		const dial = this.ai.live.connect({
 			model,
 			config: connectConfig,
 			callbacks: {
 				onopen: () => {},
-				onmessage: (msg: LiveServerMessage) => this.handleMessage(msg),
+				onmessage: (msg: LiveServerMessage) => {
+					if (gen !== this.dialGen) return;
+					this.handleMessage(msg);
+				},
 				onerror: (e: { message?: string }) => {
+					if (gen !== this.dialGen) return;
 					const error = new Error(e.message ?? 'WebSocket error');
 					this.callbacks.onError?.(error);
 					if (this.onError) this.onError({ error, recoverable: true });
 				},
 				onclose: (e: { code?: number; reason?: string }) => {
+					if (gen !== this.dialGen) return;
 					const code = e?.code;
 					const reason = e?.reason;
 					this.callbacks.onClose?.(code, reason);
@@ -253,8 +262,10 @@ export class GeminiLiveTransport implements LLMTransport {
 			this.session = await Promise.race([dial, timeout]);
 			await Promise.race([setupComplete, timeout]);
 		} catch (err) {
-			// A dial that lost the race may still open later — close the orphan
-			// so an abandoned socket cannot linger.
+			// Abandoned dial: strand its callbacks immediately, and close the
+			// socket if it still opens later — a stale close must never reach
+			// the live handlers as if it were the current connection's.
+			if (gen === this.dialGen) this.dialGen++;
 			dial.then((s) => s?.close?.()).catch(() => {});
 			throw err;
 		} finally {
