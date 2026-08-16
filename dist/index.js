@@ -2539,6 +2539,9 @@ var GeminiLiveTransport = class {
   config;
   /** Resolves when setupComplete fires — used to make connect() await Gemini readiness. */
   setupResolver = null;
+  /** Increments per dial; callbacks capture their dial's value so a
+   *  superseded dial's socket events never reach the live handlers. */
+  dialGen = 0;
   /** Tracks whether onModelTurnStart has already fired for the current turn. */
   _modelTurnStarted = false;
   // --- LLMTransport static properties ---
@@ -2642,19 +2645,25 @@ var GeminiLiveTransport = class {
         timeoutMs
       );
     });
+    const gen = ++this.dialGen;
     const dial = this.ai.live.connect({
       model,
       config: connectConfig,
       callbacks: {
         onopen: () => {
         },
-        onmessage: (msg) => this.handleMessage(msg),
+        onmessage: (msg) => {
+          if (gen !== this.dialGen) return;
+          this.handleMessage(msg);
+        },
         onerror: (e) => {
+          if (gen !== this.dialGen) return;
           const error = new Error(e.message ?? "WebSocket error");
           this.callbacks.onError?.(error);
           if (this.onError) this.onError({ error, recoverable: true });
         },
         onclose: (e) => {
+          if (gen !== this.dialGen) return;
           const code = e?.code;
           const reason = e?.reason;
           this.callbacks.onClose?.(code, reason);
@@ -2666,6 +2675,7 @@ var GeminiLiveTransport = class {
       this.session = await Promise.race([dial, timeout]);
       await Promise.race([setupComplete, timeout]);
     } catch (err) {
+      if (gen === this.dialGen) this.dialGen++;
       dial.then((s) => s?.close?.()).catch(() => {
       });
       throw err;
