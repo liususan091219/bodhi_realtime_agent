@@ -1,6 +1,7 @@
 import { z } from 'zod';
 import * as ai from 'ai';
 import { LanguageModelV1 } from 'ai';
+import { UsageMetadata } from '@google/genai';
 
 /** Classification categories for extracted memory facts. */
 type MemoryCategory = 'preference' | 'entity' | 'decision' | 'requirement';
@@ -423,6 +424,16 @@ interface TransportDiagnostics {
     /** Increments on each connection that completes setup. */
     transportGeneration: number;
 }
+/** Provider-reported token accounting, in the fields every provider shares.
+ *
+ * `promptTokenCount` is the standing prompt size — what to watch for context
+ * growth. `totalTokenCount` adds response tokens and does not describe it.
+ * Providers send more; the object passes through whole, so cast to the
+ * provider's own type (e.g. Gemini's `LiveUsageMetadata`) to read the rest. */
+interface TransportUsageMetadata {
+    promptTokenCount?: number;
+    totalTokenCount?: number;
+}
 interface LLMTransportError {
     error: Error;
     recoverable: boolean;
@@ -466,6 +477,7 @@ interface LLMTransport {
     onGoAway?: (timeLeft: string) => void;
     onResumptionUpdate?: (handle: string, resumable: boolean) => void;
     onGroundingMetadata?: (metadata: Record<string, unknown>) => void;
+    onUsageMetadata?: (usage: TransportUsageMetadata) => void;
     getDiagnostics?(): TransportDiagnostics;
     onConnectionLifecycle?: (event: ConnectionLifecycleEvent) => void;
 }
@@ -2073,6 +2085,10 @@ interface VoiceSessionConfig {
      *  `handleSupplied` on the attempt is what lets a consumer track resumed
      *  lineages without inferring them from log lines. */
     onConnectionLifecycle?: (event: ConnectionLifecycleEvent) => void;
+    /** Server-reported token accounting, once per message that carries it.
+     *  `promptTokenCount` is the standing prompt size — the signal for context
+     *  growth. Fires only on transports that report usage. */
+    onUsageMetadata?: (usage: TransportUsageMetadata) => void;
     /** With shadowSttProvider set: on divergence, SPEAK a self-correction — the
      *  model is told what the user actually said and answers the real question
      *  ("说错自纠", owner-selected option ① 2026-07-30). The shadow result
@@ -2470,6 +2486,13 @@ interface GeminiTransportConfig {
     };
 }
 /** Callbacks fired by GeminiLiveTransport when server messages arrive. */
+/** Token accounting as reported by the Live server.
+ *
+ * Aliases the SDK's own schema so every field the server sends stays reachable
+ * — a hand-written subset would silently hide cache and tool-use counts.
+ * `promptTokenCount` is the standing prompt size, the field to watch for context
+ * growth; `totalTokenCount` adds response tokens and so does not describe it. */
+type LiveUsageMetadata = UsageMetadata;
 interface GeminiTransportCallbacks {
     /** Gemini session setup is complete and ready for audio. */
     onSetupComplete?(sessionId: string): void;
@@ -2499,6 +2522,9 @@ interface GeminiTransportCallbacks {
     onResumptionUpdate?(handle: string, resumable: boolean): void;
     /** Connection-lifecycle facts (attempt / setup / close). */
     onConnectionLifecycle?(event: ConnectionLifecycleEvent): void;
+    /** Server-reported token accounting. Fires on EVERY message carrying it,
+     *  including ones that also carry serverContent, a tool call, or goAway. */
+    onUsageMetadata?(usage: LiveUsageMetadata): void;
     /** Grounding metadata from Google Search results. */
     onGroundingMetadata?(metadata: Record<string, unknown>): void;
     /** Transport-level error. */
@@ -2545,6 +2571,10 @@ declare class GeminiLiveTransport implements LLMTransport {
     onClose?: (code?: number, reason?: string) => void;
     onModelTurnStart?: () => void;
     onGoAway?: (timeLeft: string) => void;
+    /** Property form — VoiceSession wires these, not the constructor callbacks.
+     *  Typed to the neutral shape so it satisfies LLMTransport; the object passed
+     *  is the full provider payload, castable to LiveUsageMetadata. */
+    onUsageMetadata?: (usage: TransportUsageMetadata) => void;
     onResumptionUpdate?: (handle: string, resumable: boolean) => void;
     onGroundingMetadata?: (metadata: Record<string, unknown>) => void;
     constructor(config: GeminiTransportConfig, callbacks: GeminiTransportCallbacks);
@@ -2669,6 +2699,9 @@ declare class GeminiLiveTransport implements LLMTransport {
      * `sendToolResponse` on the structured path.
      */
     private replayHistory;
+    /** Run an observer without letting its failure reach dispatch. Usage rides on
+     *  the SAME message as audio and goAway, so a throwing hook would drop them. */
+    private notifyObserver;
     private handleMessage;
 }
 
@@ -2782,4 +2815,4 @@ interface QueuedNotification {
     queuedAt: number;
 }
 
-export { AUDIO_FORMAT, type AgentContext, AgentError, AgentRouter, AudioBuffer, type AudioFormat, type AudioFormatSpec, BackgroundNotificationQueue, type BehaviorCategory, type BehaviorPreset, CLOSE_CODE_CLIENT_BUSY, CLOSE_CODE_SUPERSEDED_BY_TAKEOVER, CLOSE_CODE_VERIFIER_PREEMPTED, CLOSE_REASON_CLIENT_BUSY, CLOSE_REASON_SUPERSEDED_BY_TAKEOVER, CLOSE_REASON_VERIFIER_PREEMPTED, CancelledError, type ClientConnectionRole, type ClientMessage, ClientTransport, type ClientTransportCallbacks, type ClientTransportOptions, type ConnectionLifecycleEvent, type ContentTurn, ConversationContext, type ConversationHistoryStore, ConversationHistoryWriter, type ConversationItem, type ConversationItemRole, DEFAULT_CONNECT_TIMEOUT_MS, DEFAULT_EXTRACTION_TIMEOUT_MS, DEFAULT_RECONNECT_TIMEOUT_MS, DEFAULT_SUBAGENT_TIMEOUT_MS, DEFAULT_TOOL_TIMEOUT_MS, DirectiveManager, type EchoCheckResult, type EchoEnvEntry, EchoGuard, type EchoGuardConfig, type ElevenLabsSTTConfig, ElevenLabsSTTProvider, type ErrorSeverity, EventBus, type EventHandler, type EventPayload, type EventPayloadMap, type EventSourceConfig, type EventType, type ExternalEvent, FrameworkError, type FrameworkHooks, type GeminiBatchSTTConfig, GeminiBatchSTTProvider, GeminiLiveTransport, type GeminiTransportCallbacks, type GeminiTransportConfig, HooksManager, type IEventBus, InMemorySessionStore, InputTimeoutError, InteractionModeManager, type InteractiveSubagentConfig, JsonMemoryStore, type LLMTransport, type LLMTransportConfig, type LLMTransportError, type MainAgent, MemoryCacheManager, type MemoryCategory, MemoryDistiller, type MemoryDistillerConfig, MemoryError, type MemoryFact, type MemoryStore, type NotificationPriority, type OpenAIRealtimeConfig, OpenAIRealtimeTransport, type PaginationOptions, type PendingToolCall, type QueuedNotification, type ReconnectState, type ReplayItem, type ResumptionState, type ResumptionUpdate, type RunSubagentOptions, type STTAudioConfig, type STTProvider, type SendOrQueueOptions, type ServiceSubagentConfig, type SessionAnalytics, type SessionCheckpoint, SessionCompletedError, type SessionConfig, SessionError, type SessionInteractionMode, SessionManager, type SessionRecord, type SessionReport, type SessionState, type SessionStore, type SessionSummary, type SessionUpdate, type SubagentConfig, type SubagentContextSnapshot, type SubagentEventCallbacks, type SubagentMessage, type SubagentResult, type SubagentSession, SubagentSessionImpl, type SubagentSessionState, type SubagentTask, type ToolCall, ToolCallRouter, type ToolCallRouterDeps, type ToolContext, type ToolDefinition, type ToolExecution, ToolExecutionError, ToolExecutor, type ToolResult, TranscriptManager, type TranscriptSink, type TransportAuth, type TransportCapabilities, type TransportDiagnostics, TransportError, type TransportPendingToolCall, type TransportToolCall, type TransportToolResult, type UIPayload, type UIResponse, type Unsubscribe, type UpstreamCounters, type UpstreamSlotCounters, ValidationError, VoiceSession, type VoiceSessionConfig, type VoiceSessionDiagnostics, bestEnvelopeLag, createAgentContext, createAskUserTool, envelopePearson, runSubagent, zodToJsonSchema };
+export { AUDIO_FORMAT, type AgentContext, AgentError, AgentRouter, AudioBuffer, type AudioFormat, type AudioFormatSpec, BackgroundNotificationQueue, type BehaviorCategory, type BehaviorPreset, CLOSE_CODE_CLIENT_BUSY, CLOSE_CODE_SUPERSEDED_BY_TAKEOVER, CLOSE_CODE_VERIFIER_PREEMPTED, CLOSE_REASON_CLIENT_BUSY, CLOSE_REASON_SUPERSEDED_BY_TAKEOVER, CLOSE_REASON_VERIFIER_PREEMPTED, CancelledError, type ClientConnectionRole, type ClientMessage, ClientTransport, type ClientTransportCallbacks, type ClientTransportOptions, type ConnectionLifecycleEvent, type ContentTurn, ConversationContext, type ConversationHistoryStore, ConversationHistoryWriter, type ConversationItem, type ConversationItemRole, DEFAULT_CONNECT_TIMEOUT_MS, DEFAULT_EXTRACTION_TIMEOUT_MS, DEFAULT_RECONNECT_TIMEOUT_MS, DEFAULT_SUBAGENT_TIMEOUT_MS, DEFAULT_TOOL_TIMEOUT_MS, DirectiveManager, type EchoCheckResult, type EchoEnvEntry, EchoGuard, type EchoGuardConfig, type ElevenLabsSTTConfig, ElevenLabsSTTProvider, type ErrorSeverity, EventBus, type EventHandler, type EventPayload, type EventPayloadMap, type EventSourceConfig, type EventType, type ExternalEvent, FrameworkError, type FrameworkHooks, type GeminiBatchSTTConfig, GeminiBatchSTTProvider, GeminiLiveTransport, type GeminiTransportCallbacks, type GeminiTransportConfig, HooksManager, type IEventBus, InMemorySessionStore, InputTimeoutError, InteractionModeManager, type InteractiveSubagentConfig, JsonMemoryStore, type LLMTransport, type LLMTransportConfig, type LLMTransportError, type LiveUsageMetadata, type MainAgent, MemoryCacheManager, type MemoryCategory, MemoryDistiller, type MemoryDistillerConfig, MemoryError, type MemoryFact, type MemoryStore, type NotificationPriority, type OpenAIRealtimeConfig, OpenAIRealtimeTransport, type PaginationOptions, type PendingToolCall, type QueuedNotification, type ReconnectState, type ReplayItem, type ResumptionState, type ResumptionUpdate, type RunSubagentOptions, type STTAudioConfig, type STTProvider, type SendOrQueueOptions, type ServiceSubagentConfig, type SessionAnalytics, type SessionCheckpoint, SessionCompletedError, type SessionConfig, SessionError, type SessionInteractionMode, SessionManager, type SessionRecord, type SessionReport, type SessionState, type SessionStore, type SessionSummary, type SessionUpdate, type SubagentConfig, type SubagentContextSnapshot, type SubagentEventCallbacks, type SubagentMessage, type SubagentResult, type SubagentSession, SubagentSessionImpl, type SubagentSessionState, type SubagentTask, type ToolCall, ToolCallRouter, type ToolCallRouterDeps, type ToolContext, type ToolDefinition, type ToolExecution, ToolExecutionError, ToolExecutor, type ToolResult, TranscriptManager, type TranscriptSink, type TransportAuth, type TransportCapabilities, type TransportDiagnostics, TransportError, type TransportPendingToolCall, type TransportToolCall, type TransportToolResult, type TransportUsageMetadata, type UIPayload, type UIResponse, type Unsubscribe, type UpstreamCounters, type UpstreamSlotCounters, ValidationError, VoiceSession, type VoiceSessionConfig, type VoiceSessionDiagnostics, bestEnvelopeLag, createAgentContext, createAskUserTool, envelopePearson, runSubagent, zodToJsonSchema };
