@@ -2112,6 +2112,10 @@ interface VoiceSessionConfig {
      *  state (e.g. voice-stalled) exactly when a client is there to hear it. */
     onClientConnected?: () => void;
     onClientDisconnected?: () => void;
+    /** When true at attach time, the client is configured but greeting,
+     *  context replay and the CLOSED auto-reconnect are suppressed — the
+     *  host's recovery-terminal gate (no uncounted dials past its budget). */
+    suppressClientAutoActions?: () => boolean;
     /** With shadowSttProvider set: on divergence, SPEAK a self-correction — the
      *  model is told what the user actually said and answers the real question
      *  ("说错自纠", owner-selected option ① 2026-07-30). The shadow result

@@ -158,3 +158,73 @@ describe('host-facing client surface', () => {
 		expect(edges).toContain('disconnected');
 	});
 });
+
+describe('suppressClientAutoActions (terminal gate)', () => {
+	let session: VoiceSession | null = null;
+	let client: WebSocket | null = null;
+	afterEach(async () => {
+		if (client) {
+			client.close();
+			client = null;
+		}
+		if (session) await session.close();
+		session = null;
+	});
+
+	it('suppresses greeting and context replay on attach, but still configures the client', async () => {
+		let suppress = false;
+		session = await startSession(9955, {
+			suppressClientAutoActions: () => suppress,
+		});
+		const sent: unknown[] = [];
+		const sendSpy = (
+			session as unknown as {
+				transport: { sendContent: (c: unknown, t: boolean) => void };
+			}
+		).transport;
+		const orig = sendSpy.sendContent.bind(sendSpy);
+		sendSpy.sendContent = (c: unknown, t: boolean) => {
+			sent.push(c);
+			orig(c, t);
+		};
+		suppress = true;
+		(session as unknown as { turnId: number }).turnId = 3;
+		// Collect frames from socket creation — session.config is sent
+		// synchronously on attach, before an after-open listener could bind.
+		const frames: string[] = [];
+		client = await new Promise<WebSocket>((resolve, reject) => {
+			const ws = new WebSocket('ws://localhost:9955');
+			ws.on('message', (data, isBinary) => {
+				if (!isBinary) frames.push(data.toString());
+			});
+			ws.on('open', () => resolve(ws));
+			ws.on('error', reject);
+		});
+		await settle(80);
+		// The client still gets session.config (configuration is not gated)…
+		expect(frames.some((f) => (JSON.parse(f) as { type?: string }).type === 'session.config')).toBe(
+			true,
+		);
+		// …but no greeting or context replay reached the model.
+		const text = JSON.stringify(sent);
+		expect(text.includes('Greet')).toBe(false);
+		expect(text.includes('reconnected')).toBe(false);
+	});
+
+	it('suppresses the CLOSED-branch auto-reconnect while gated', async () => {
+		const suppress = true;
+		session = await startSession(9956, {
+			suppressClientAutoActions: () => suppress,
+		});
+		const { _getMessageHandler } = await import('@google/genai');
+		void _getMessageHandler;
+		// Force CLOSED, then attach a client: the ordinary redial must NOT fire.
+		const priv = session as unknown as {
+			sessionManager: { transitionTo: (s: string) => void; state: string };
+		};
+		priv.sessionManager.transitionTo('CLOSED');
+		client = await openClient(9956);
+		await settle(80);
+		expect(priv.sessionManager.state).toBe('CLOSED');
+	});
+});

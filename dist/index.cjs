@@ -4322,6 +4322,10 @@ ${agent.greeting}` : agent.greeting;
       audioFormat: this.transport.audioFormat
     });
     this.behaviorManager?.sendCatalog();
+    if (this.config.suppressClientAutoActions?.()) {
+      this.log("Client auto-actions suppressed by host gate");
+      return;
+    }
     if (this.sessionManager.isActive) {
       if (this.turnId === 0) {
         this.sendGreeting();
