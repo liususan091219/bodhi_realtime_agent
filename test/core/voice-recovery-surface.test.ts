@@ -234,6 +234,28 @@ describe('recovery surface', () => {
 		expect(events[0].transportGeneration).toBe(recoverySetup.transportGeneration);
 	});
 
+	it('turn.start carries the dial-domain attemptEpoch, so the documented fence compares like with like', async () => {
+		session = await startSession(9945);
+		const events: Array<{ transportGeneration?: number; attemptEpoch?: number }> = [];
+		session.eventBus.subscribe('turn.start', (e: unknown) =>
+			events.push(e as { transportGeneration?: number; attemptEpoch?: number }),
+		);
+		const r = session.recoverUpstream({
+			reason: 'active-silence',
+			skipContextInjection: true,
+			holdSyntheticUntilFreshSpeech: false,
+		});
+		await r.activated;
+		(await fire())({ serverContent: { modelTurn: { parts: [{ inlineData: { data: 'AAAA' } }] } } });
+		expect(events.length).toBe(1);
+		// The contract says a turn.start below the epoch is stale. That is only a
+		// valid test in ONE domain: the dial counter also advances on failed and
+		// aborted dials, so the post-setup counter is legitimately lower and a
+		// coordinator comparing it against the epoch rejects a VALID replacement.
+		expect(events[0].attemptEpoch).toBe(r.attemptEpoch);
+		expect(events[0].attemptEpoch).toBeGreaterThanOrEqual(events[0].transportGeneration as number);
+	});
+
 	it('recovery clears the transport-side resumption handle: the redial sends none', async () => {
 		session = await startSession(9939);
 		// Server grants a resumable handle — the transport stores it and would

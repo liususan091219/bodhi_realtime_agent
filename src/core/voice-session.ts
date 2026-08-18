@@ -236,8 +236,12 @@ export interface RecoverUpstreamArgs {
 }
 
 export interface RecoverUpstreamResult {
-	/** Transport generation after the synchronous bump; callbacks, acks and
-	 *  turn.start events carrying a lower generation are stale. */
+	/** The DIAL generation this recovery dials on — the same domain as the
+	 *  tool-call and turn.start `attemptEpoch` fences, and as the lifecycle
+	 *  `att_<n>` attempt id. NOT `turn.start.transportGeneration`, which is the
+	 *  post-setup counter and is legitimately lower (the dial counter also
+	 *  advances on failed and aborted dials). Compare dial to dial: callbacks,
+	 *  acks and turn.start events carrying a lower `attemptEpoch` are stale. */
 	attemptEpoch: number;
 	/** Resolves when the replacement transport is ACTIVE; rejects on dial
 	 *  failure (the caller's reducer enters waiting-retry on rejection). */
@@ -612,6 +616,9 @@ export class VoiceSession {
 				turnId: `turn_${this.turnId + 1}`,
 				transportGeneration: (this.transport as { currentTransportGeneration?: number })
 					.currentTransportGeneration,
+				// Both counters, because they are different domains: a consumer
+				// fencing on recoverUpstream's epoch must compare dial to dial.
+				attemptEpoch: (this.transport as { currentDialGen?: number }).currentDialGen,
 			});
 			if (this.sttProvider && !this._commitFiredForTurn) {
 				this._commitFiredForTurn = true;
@@ -1289,6 +1296,8 @@ export class VoiceSession {
 	 *  Partial transcripts are flushed (committed) rather than merged into the
 	 *  next turn; late deltas from the dead generation are rejected by the
 	 *  transport's ingress fencing. */
+	/** The published `transportGeneration` field carries the DIAL generation
+	 *  (its only caller passes attemptEpoch); the name predates the split. */
 	private beginReconnectBoundary(reason: string, transportGeneration: number): void {
 		if (this._lastBoundaryGen !== null && transportGeneration <= this._lastBoundaryGen) return;
 		this._lastBoundaryGen = transportGeneration;
