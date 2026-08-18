@@ -74,6 +74,11 @@ export interface VoiceSessionConfig {
 	/** Context-window compression. Supply the object with NO thresholds to enable
 	 *  it with the server's defaults (trigger 80% of the model limit, target half). */
 	compressionConfig?: { triggerTokens?: number; targetTokens?: number };
+	/** Session-wide media token cost for video/image input (Gemini only). LOW =
+	 *  64 tokens per frame. Applies to every realtime-input image on the session,
+	 *  one-shots included — realtime input has no per-send override. (Client-
+	 *  content Parts can override per-part; this transport does not send those.) */
+	mediaResolution?: 'MEDIA_RESOLUTION_LOW' | 'MEDIA_RESOLUTION_MEDIUM' | 'MEDIA_RESOLUTION_HIGH';
 	/** Gemini automatic-VAD tuning — passed through to the Live API as
 	 *  realtimeInputConfig.automaticActivityDetection. Shorten silenceDurationMs
 	 *  to make end-of-turn detection (and thus the bot's reply) faster. */
@@ -369,6 +374,7 @@ export class VoiceSession {
 					googleSearch: initialAgent?.googleSearch,
 					speechConfig: config.speechConfig,
 					compressionConfig: config.compressionConfig,
+					mediaResolution: config.mediaResolution,
 					vadConfig: config.vadConfig,
 					inputAudioTranscription: inputTranscription,
 				},
