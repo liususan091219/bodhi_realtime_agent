@@ -2416,7 +2416,9 @@ var EchoGuard = class {
 };
 
 // src/transport/gemini-live-transport.ts
-import { GoogleGenAI } from "@google/genai";
+import {
+  GoogleGenAI
+} from "@google/genai";
 
 // src/transport/zod-to-schema.ts
 var TYPE_MAP = {
@@ -2583,6 +2585,10 @@ var GeminiLiveTransport = class {
   onClose;
   onModelTurnStart;
   onGoAway;
+  /** Property form — VoiceSession wires these, not the constructor callbacks.
+   *  Typed to the neutral shape so it satisfies LLMTransport; the object passed
+   *  is the full provider payload, castable to LiveUsageMetadata. */
+  onUsageMetadata;
   onResumptionUpdate;
   onGroundingMetadata;
   constructor(config, callbacks) {
@@ -3068,8 +3074,22 @@ var GeminiLiveTransport = class {
       }
     }
   }
+  /** Run an observer without letting its failure reach dispatch. Usage rides on
+   *  the SAME message as audio and goAway, so a throwing hook would drop them. */
+  notifyObserver(label, fn) {
+    try {
+      fn();
+    } catch (err) {
+      console.warn(`[GeminiLiveTransport] ${label} observer threw; dispatch continues:`, err);
+    }
+  }
   // biome-ignore lint/suspicious/noExplicitAny: LiveServerMessage is a complex union type
   handleMessage(msg) {
+    if (msg.usageMetadata) {
+      const usage = msg.usageMetadata;
+      this.notifyObserver("onUsageMetadata", () => this.callbacks.onUsageMetadata?.(usage));
+      this.notifyObserver("onUsageMetadata", () => this.onUsageMetadata?.(usage));
+    }
     if (msg.setupComplete) {
       this.transportGeneration++;
       this.upstream = freshUpstreamCounters();
@@ -3450,6 +3470,9 @@ var VoiceSession = class _VoiceSession {
     this.transport.onGroundingMetadata = (metadata) => this.handleGroundingMetadata(metadata);
     if (config.onConnectionLifecycle) {
       this.transport.onConnectionLifecycle = (event) => config.onConnectionLifecycle?.(event);
+    }
+    if (config.onUsageMetadata) {
+      this.transport.onUsageMetadata = (usage) => config.onUsageMetadata?.(usage);
     }
     if (config.sttProvider) {
       this.sttProvider = config.sttProvider;
