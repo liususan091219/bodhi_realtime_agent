@@ -177,6 +177,24 @@ describe('VoiceSession', () => {
 		expect(d.echoSuppressed).toBe(0);
 	});
 
+	it('surfaces connection-lifecycle events through the default VoiceSession path', async () => {
+		const events: Array<{ kind: string }> = [];
+		session = new VoiceSession({
+			sessionId: 'sess_lc',
+			userId: 'user_1',
+			apiKey: 'test-key',
+			agents: [createEchoAgent()],
+			initialAgent: 'echo',
+			port: 9896,
+			model: mockModel,
+			onConnectionLifecycle: (e) => events.push(e),
+		});
+		await session.start();
+		await new Promise((r) => setTimeout(r, 50));
+
+		expect(events.map((e) => e.kind)).toEqual(['attempt', 'setup-ok']);
+	});
+
 	it('creates with all components', () => {
 		session = new VoiceSession({
 			sessionId: 'sess_1',

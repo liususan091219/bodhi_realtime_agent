@@ -15,6 +15,7 @@ import type { BehaviorCategory } from '../types/behavior.js';
 import type { FrameworkHooks } from '../types/hooks.js';
 import type { MemoryStore } from '../types/memory.js';
 import type {
+	ConnectionLifecycleEvent,
 	LLMTransport,
 	LLMTransportError,
 	STTProvider,
@@ -100,6 +101,11 @@ export interface VoiceSessionConfig {
 	/** Called when the shadow STT disagrees with the built-in transcription
 	 *  (normalized compare; containment = streaming truncation, not a mishear). */
 	onTranscriptionDivergence?: (liveText: string, shadowText: string, turnId?: number) => void;
+	/** Connection-lifecycle facts: attempt / setup-ok / setup-failed /
+	 *  attempt-close / generation-close, correlated by connectAttemptId.
+	 *  `handleSupplied` on the attempt is what lets a consumer track resumed
+	 *  lineages without inferring them from log lines. */
+	onConnectionLifecycle?: (event: ConnectionLifecycleEvent) => void;
 	/** With shadowSttProvider set: on divergence, SPEAK a self-correction — the
 	 *  model is told what the user actually said and answers the real question
 	 *  ("说错自纠", owner-selected option ① 2026-07-30). The shadow result
@@ -377,6 +383,9 @@ export class VoiceSession {
 		this.transport.onResumptionUpdate = (handle, resumable) =>
 			this.handleResumptionUpdate(handle, resumable);
 		this.transport.onGroundingMetadata = (metadata) => this.handleGroundingMetadata(metadata);
+		if (config.onConnectionLifecycle) {
+			this.transport.onConnectionLifecycle = (event) => config.onConnectionLifecycle?.(event);
+		}
 
 		// Wire STT: exactly one transcript path is active per session.
 		if (config.sttProvider) {

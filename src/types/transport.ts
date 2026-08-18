@@ -212,6 +212,27 @@ export interface UpstreamCounters {
 	text: UpstreamSlotCounters & { skippedEmpty: number };
 }
 
+/** Connection-lifecycle facts, one event per observable transition.
+ *
+ * Variants are split rather than made optional because `transportGeneration`
+ * is minted only on successful setup: a socket that dies BEFORE setupComplete
+ * has no generation, and a single close variant requiring one could not
+ * represent exactly the failures these events exist to preserve. A consumer
+ * correlates by `connectAttemptId`; more than one event can describe one
+ * attempt (e.g. attempt-close followed by setup-failed on timeout). */
+export type ConnectionLifecycleEvent =
+	| { kind: 'attempt'; connectAttemptId: string; handleSupplied: boolean }
+	| { kind: 'setup-ok'; connectAttemptId: string; transportGeneration: number }
+	| { kind: 'setup-failed'; connectAttemptId: string; reason?: string }
+	| { kind: 'attempt-close'; connectAttemptId: string; code?: number; reason?: string }
+	| {
+			kind: 'generation-close';
+			connectAttemptId: string;
+			transportGeneration: number;
+			code?: number;
+			reason?: string;
+	  };
+
 /** Point-in-time transport diagnostics; safe to sample on any tick. */
 export interface TransportDiagnostics {
 	upstream: UpstreamCounters;
@@ -290,4 +311,5 @@ export interface LLMTransport {
 
 	// --- Optional diagnostics (only on supporting transports) ---
 	getDiagnostics?(): TransportDiagnostics;
+	onConnectionLifecycle?: (event: ConnectionLifecycleEvent) => void;
 }

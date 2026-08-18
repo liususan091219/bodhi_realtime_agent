@@ -66,6 +66,7 @@ export type {
 	STTAudioConfig,
 	STTProvider,
 	TransportAuth,
+	ConnectionLifecycleEvent,
 	TransportCapabilities,
 	TransportDiagnostics,
 	UpstreamCounters,
