@@ -581,16 +581,6 @@ var AgentRouter = class {
     this.extraTools = extraTools;
     this.subagentCallbacks = subagentCallbacks;
   }
-  sessionManager;
-  eventBus;
-  hooks;
-  conversationContext;
-  transport;
-  clientTransport;
-  model;
-  getInstructionSuffix;
-  extraTools;
-  subagentCallbacks;
   agents = /* @__PURE__ */ new Map();
   _activeAgent = null;
   activeSubagents = /* @__PURE__ */ new Map();
@@ -781,9 +771,6 @@ var BackgroundNotificationQueue = class {
     this.log = log;
     this.messageTruncation = messageTruncation;
   }
-  sendContent;
-  log;
-  messageTruncation;
   queue = [];
   audioReceived = false;
   interrupted = false;
@@ -1171,12 +1158,6 @@ var ConversationHistoryWriter = class {
     this.store = store;
     this.subscribe();
   }
-  sessionId;
-  userId;
-  initialAgentName;
-  eventBus;
-  conversationContext;
-  store;
   unsubscribers = [];
   analytics = {
     turnCount: 0,
@@ -1284,8 +1265,6 @@ var SessionManager = class {
     this.userId = config.userId;
     this.initialAgent = config.initialAgent;
   }
-  eventBus;
-  hooks;
   _state = "CREATED";
   _resumptionHandle = null;
   _bufferedMessages = [];
@@ -1403,8 +1382,6 @@ var MemoryCacheManager = class {
     this.store = store;
     this.userId = userId;
   }
-  store;
-  userId;
   cache = [];
   /** Reload cached facts from the store. Best-effort: keeps stale cache on failure. */
   async refresh() {
@@ -1580,7 +1557,6 @@ var TranscriptManager = class {
   constructor(sink) {
     this.sink = sink;
   }
-  sink;
   inputBuffer = "";
   outputBuffer = "";
   /** Pre-tool-call output text, saved when a tool call splits a turn. */
@@ -1875,10 +1851,6 @@ var MemoryDistiller = class {
     this.turnFrequency = config.turnFrequency ?? 5;
     this.extractionTimeoutMs = config.extractionTimeoutMs ?? DEFAULT_EXTRACTION_TIMEOUT_MS;
   }
-  conversationContext;
-  memoryStore;
-  hooks;
-  model;
   turnCount = 0;
   extractionInFlight = false;
   turnFrequency;
@@ -1972,12 +1944,6 @@ var ToolExecutor = class {
     this.sendJsonToClient = sendJsonToClient;
     this.setDirective = setDirective;
   }
-  hooks;
-  eventBus;
-  sessionId;
-  agentName;
-  sendJsonToClient;
-  setDirective;
   tools = /* @__PURE__ */ new Map();
   pending = /* @__PURE__ */ new Map();
   register(tools) {
@@ -2184,11 +2150,6 @@ var ClientTransport = class {
     this.listenTimeoutMs = listenTimeoutMs;
     this.options = options;
   }
-  port;
-  callbacks;
-  host;
-  listenTimeoutMs;
-  options;
   wss = null;
   client = null;
   clientRole = null;
@@ -2620,6 +2581,29 @@ function convertDef(def, format) {
 }
 
 // src/transport/gemini-live-transport.ts
+function freshSlot() {
+  return {
+    attempted: 0,
+    queued: 0,
+    skippedNoSession: 0,
+    threw: 0,
+    attemptedRawBytes: 0,
+    queuedRawBytes: 0,
+    attemptedWireBytesEstimate: 0,
+    queuedWireBytesEstimate: 0,
+    lastAttemptedAt: null,
+    lastQueuedAt: null,
+    lastSkippedAt: null,
+    lastThrewAt: null
+  };
+}
+function freshUpstreamCounters() {
+  return {
+    audio: freshSlot(),
+    video: { ...freshSlot(), unsupportedMime: 0 },
+    text: { ...freshSlot(), skippedEmpty: 0 }
+  };
+}
 var GeminiLiveTransport = class {
   session = null;
   ai;
@@ -2630,6 +2614,8 @@ var GeminiLiveTransport = class {
   /** Increments per dial; callbacks capture their dial's value so a
    *  superseded dial's socket events never reach the live handlers. */
   dialGen = 0;
+  transportGeneration = 0;
+  upstream = freshUpstreamCounters();
   /** Tracks whether onModelTurnStart has already fired for the current turn. */
   _modelTurnStarted = false;
   // --- LLMTransport static properties ---
@@ -2802,12 +2788,49 @@ var GeminiLiveTransport = class {
       this.session = null;
     }
   }
+  noteAttempt(slot, rawBytes, wireBytes) {
+    slot.attempted++;
+    slot.attemptedRawBytes += rawBytes;
+    slot.attemptedWireBytesEstimate += wireBytes;
+    slot.lastAttemptedAt = Date.now();
+  }
+  noteSkip(slot, bump) {
+    bump();
+    slot.lastSkippedAt = Date.now();
+  }
+  /** Runs the send; `queued` advances only on normal return. Exceptions are
+   *  counted and RETHROWN — instrumentation must not change error behavior. */
+  sendTracked(slot, rawBytes, wireBytes, send) {
+    try {
+      send();
+    } catch (err) {
+      slot.threw++;
+      slot.lastThrewAt = Date.now();
+      throw err;
+    }
+    slot.queued++;
+    slot.queuedRawBytes += rawBytes;
+    slot.queuedWireBytesEstimate += wireBytes;
+    slot.lastQueuedAt = Date.now();
+  }
   /** Send base64-encoded PCM audio to Gemini as realtime input. */
   sendAudio(base64Data) {
-    if (!this.session) return;
-    this.session.sendRealtimeInput({
-      audio: { data: base64Data, mimeType: "audio/pcm;rate=16000" }
-    });
+    const slot = this.upstream.audio;
+    const raw = Buffer.byteLength(base64Data, "base64");
+    this.noteAttempt(slot, raw, base64Data.length);
+    const session = this.session;
+    if (!session) {
+      this.noteSkip(slot, () => slot.skippedNoSession++);
+      return;
+    }
+    this.sendTracked(
+      slot,
+      raw,
+      base64Data.length,
+      () => session.sendRealtimeInput({
+        audio: { data: base64Data, mimeType: "audio/pcm;rate=16000" }
+      })
+    );
   }
   /** Send tool execution results back to Gemini (legacy API). */
   sendToolResponse(responses, _scheduling) {
@@ -2829,14 +2852,12 @@ var GeminiLiveTransport = class {
    * Live API decides turn boundaries via automatic activity detection.
    */
   sendClientContent(turns, _turnComplete = true) {
-    if (!this.session) return;
     const text = turns.map((t) => {
       const body = (t.parts || []).map((p) => p.text).filter(Boolean).join(" ");
       if (!body) return "";
       return turns.length > 1 ? `${t.role}: ${body}` : body;
     }).filter(Boolean).join("\n");
-    if (!text) return;
-    this.session.sendRealtimeInput({ text });
+    this.sendText(text);
   }
   /** Update the tool declarations (applied on next reconnect). */
   updateTools(tools) {
@@ -2853,6 +2874,13 @@ var GeminiLiveTransport = class {
   get isConnected() {
     return this.session !== null;
   }
+  /** Snapshot, not a live reference — safe for a caller to hold across ticks. */
+  getDiagnostics() {
+    return {
+      upstream: structuredClone(this.upstream),
+      transportGeneration: this.transportGeneration
+    };
+  }
   // --- LLMTransport methods ---
   /** Send provider-neutral content turns to Gemini.
    *
@@ -2862,14 +2890,29 @@ var GeminiLiveTransport = class {
    * turns in the injected context.
    */
   sendContent(turns, _turnComplete = true) {
-    if (!this.session) return;
     const text = turns.map((t) => {
       const role = t.role === "assistant" ? "model" : t.role;
       if (!t.text) return "";
       return turns.length > 1 ? `${role}: ${t.text}` : t.text;
     }).filter(Boolean).join("\n");
-    if (!text) return;
-    this.session.sendRealtimeInput({ text });
+    this.sendText(text);
+  }
+  /** Shared tracked path for both text APIs — they differ only in how the
+   *  joined text is assembled, so the state machine lives once. */
+  sendText(text) {
+    const slot = this.upstream.text;
+    const bytes = Buffer.byteLength(text, "utf8");
+    this.noteAttempt(slot, bytes, bytes);
+    const session = this.session;
+    if (!session) {
+      this.noteSkip(slot, () => slot.skippedNoSession++);
+      return;
+    }
+    if (!text) {
+      this.noteSkip(slot, () => slot.skippedEmpty++);
+      return;
+    }
+    this.sendTracked(slot, bytes, bytes, () => session.sendRealtimeInput({ text }));
   }
   /** Send a file/image to Gemini as realtime input.
    *
@@ -2891,19 +2934,33 @@ var GeminiLiveTransport = class {
    *           [System: user attached file] prefix text instead.
    */
   sendFile(base64Data, mimeType) {
-    if (!this.session) return;
+    const slot = mimeType.startsWith("audio/") ? this.upstream.audio : this.upstream.video;
+    const raw = Buffer.byteLength(base64Data, "base64");
+    this.noteAttempt(slot, raw, base64Data.length);
+    const session = this.session;
+    if (!session) {
+      this.noteSkip(slot, () => slot.skippedNoSession++);
+      return;
+    }
     if (mimeType.startsWith("image/")) {
-      this.session.sendRealtimeInput({
-        video: { data: base64Data, mimeType }
-      });
+      this.sendTracked(
+        slot,
+        raw,
+        base64Data.length,
+        () => session.sendRealtimeInput({ video: { data: base64Data, mimeType } })
+      );
       return;
     }
     if (mimeType.startsWith("audio/")) {
-      this.session.sendRealtimeInput({
-        audio: { data: base64Data, mimeType }
-      });
+      this.sendTracked(
+        slot,
+        raw,
+        base64Data.length,
+        () => session.sendRealtimeInput({ audio: { data: base64Data, mimeType } })
+      );
       return;
     }
+    this.noteSkip(this.upstream.video, () => this.upstream.video.unsupportedMime++);
     console.warn(
       `[GeminiLiveTransport] sendFile: unsupported mimeType "${mimeType}" \u2014 Gemini Live realtime_input only supports image/* and audio/*. For other file types, summarize via sendContent with a text marker.`
     );
@@ -3029,19 +3086,34 @@ var GeminiLiveTransport = class {
       }
     }
     if (textChunks.length > 0) {
-      this.session.sendRealtimeInput({ text: textChunks.join("\n") });
+      this.sendText(textChunks.join("\n"));
     }
     for (const item of items) {
       if (item.type === "file") {
-        this.session.sendRealtimeInput({
-          media: { data: item.base64Data, mimeType: item.mimeType }
-        });
+        const slot = item.mimeType.startsWith("audio/") ? this.upstream.audio : this.upstream.video;
+        const raw = Buffer.byteLength(item.base64Data, "base64");
+        this.noteAttempt(slot, raw, item.base64Data.length);
+        const session = this.session;
+        if (!session) {
+          this.noteSkip(slot, () => slot.skippedNoSession++);
+          continue;
+        }
+        this.sendTracked(
+          slot,
+          raw,
+          item.base64Data.length,
+          () => session.sendRealtimeInput({
+            media: { data: item.base64Data, mimeType: item.mimeType }
+          })
+        );
       }
     }
   }
   // biome-ignore lint/suspicious/noExplicitAny: LiveServerMessage is a complex union type
   handleMessage(msg) {
     if (msg.setupComplete) {
+      this.transportGeneration++;
+      this.upstream = freshUpstreamCounters();
       if (this.setupResolver) {
         this.setupResolver();
         this.setupResolver = null;
@@ -3562,6 +3634,22 @@ var VoiceSession = class _VoiceSession {
     });
   }
   /**
+   * Point-in-time send-path diagnostics; safe to sample on any tick.
+   *
+   * `upstream`/`transportGeneration` are null on transports that do not report
+   * diagnostics (injected fakes, other providers) — null means unobserved,
+   * never zero. `echoSuppressed` is session-owned: the guard is private, and
+   * suppressed frames never reach the transport counters.
+   */
+  getDiagnostics() {
+    const t = this.transport.getDiagnostics?.();
+    return {
+      upstream: t?.upstream ?? null,
+      transportGeneration: t?.transportGeneration ?? null,
+      echoSuppressed: this.echoGuard?.suppressedCount ?? 0
+    };
+  }
+  /**
    * Queue a short spoken update for the user.
    * Delivered immediately when possible, otherwise after the current turn.
    */
@@ -4027,7 +4115,6 @@ var JsonMemoryStore = class {
   constructor(baseDir) {
     this.baseDir = baseDir;
   }
-  baseDir;
   async addFacts(userId, facts) {
     if (facts.length === 0) return;
     const filePath = this.filePath(userId);
