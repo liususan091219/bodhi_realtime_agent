@@ -240,6 +240,17 @@ export interface TransportDiagnostics {
 	transportGeneration: number;
 }
 
+/** Provider-reported token accounting, in the fields every provider shares.
+ *
+ * `promptTokenCount` is the standing prompt size — what to watch for context
+ * growth. `totalTokenCount` adds response tokens and does not describe it.
+ * Providers send more; the object passes through whole, so cast to the
+ * provider's own type (e.g. Gemini's `LiveUsageMetadata`) to read the rest. */
+export interface TransportUsageMetadata {
+	promptTokenCount?: number;
+	totalTokenCount?: number;
+}
+
 export interface LLMTransportError {
 	error: Error;
 	recoverable: boolean;
@@ -308,6 +319,7 @@ export interface LLMTransport {
 	onGoAway?: (timeLeft: string) => void;
 	onResumptionUpdate?: (handle: string, resumable: boolean) => void;
 	onGroundingMetadata?: (metadata: Record<string, unknown>) => void;
+	onUsageMetadata?: (usage: TransportUsageMetadata) => void;
 
 	// --- Optional diagnostics (only on supporting transports) ---
 	getDiagnostics?(): TransportDiagnostics;

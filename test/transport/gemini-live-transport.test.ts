@@ -2,7 +2,10 @@
 
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { z } from 'zod';
-import { GeminiLiveTransport } from '../../src/transport/gemini-live-transport.js';
+import {
+	GeminiLiveTransport,
+	type LiveUsageMetadata,
+} from '../../src/transport/gemini-live-transport.js';
 import type { ToolDefinition } from '../../src/types/tool.js';
 
 // Mock @google/genai
@@ -717,6 +720,122 @@ describe('GeminiLiveTransport', () => {
 			transport.sendClientContent([{ role: 'user', parts: [] }]);
 
 			expect(mockSession.sendRealtimeInput).not.toHaveBeenCalled();
+		});
+	});
+
+	describe('usage metadata', () => {
+		async function connectWith(onUsageMetadata: ReturnType<typeof vi.fn>) {
+			const transport = new GeminiLiveTransport({ apiKey: 'test-key' }, { onUsageMetadata });
+			await transport.connect();
+			return capturedConnectConfig.callbacks as Record<string, (msg: unknown) => void>;
+		}
+		const USAGE = { promptTokenCount: 4096, totalTokenCount: 4200 };
+
+		it('dispatches usage metadata on its own', async () => {
+			const onUsageMetadata = vi.fn();
+			const cbs = await connectWith(onUsageMetadata);
+			cbs.onmessage({ usageMetadata: USAGE });
+			expect(onUsageMetadata).toHaveBeenCalledWith(USAGE);
+		});
+
+		// The reason usage is read before the dispatch branches: every branch below
+		// returns, so a branch of its own would miss the common co-occurring cases.
+		it('dispatches usage metadata riding along with serverContent', async () => {
+			const onUsageMetadata = vi.fn();
+			const onAudioOutput = vi.fn();
+			const transport = new GeminiLiveTransport(
+				{ apiKey: 'test-key' },
+				{ onUsageMetadata, onAudioOutput },
+			);
+			await transport.connect();
+			const cbs = capturedConnectConfig.callbacks as Record<string, (msg: unknown) => void>;
+			cbs.onmessage({
+				usageMetadata: USAGE,
+				serverContent: { modelTurn: { parts: [{ inlineData: { data: 'audio_b64' } }] } },
+			});
+			expect(onUsageMetadata).toHaveBeenCalledWith(USAGE);
+			expect(onAudioOutput).toHaveBeenCalledWith('audio_b64');
+		});
+
+		it('dispatches usage metadata riding along with a tool call', async () => {
+			const onUsageMetadata = vi.fn();
+			const onToolCall = vi.fn();
+			const transport = new GeminiLiveTransport(
+				{ apiKey: 'test-key' },
+				{ onUsageMetadata, onToolCall },
+			);
+			await transport.connect();
+			const cbs = capturedConnectConfig.callbacks as Record<string, (msg: unknown) => void>;
+			cbs.onmessage({
+				usageMetadata: USAGE,
+				toolCall: { functionCalls: [{ id: 'fc_1', name: 'search', args: { query: 'x' } }] },
+			});
+			expect(onUsageMetadata).toHaveBeenCalledWith(USAGE);
+			expect(onToolCall).toHaveBeenCalled();
+		});
+
+		it('dispatches usage metadata riding along with goAway', async () => {
+			const onUsageMetadata = vi.fn();
+			const onGoAway = vi.fn();
+			const transport = new GeminiLiveTransport(
+				{ apiKey: 'test-key' },
+				{ onUsageMetadata, onGoAway },
+			);
+			await transport.connect();
+			const cbs = capturedConnectConfig.callbacks as Record<string, (msg: unknown) => void>;
+			cbs.onmessage({ usageMetadata: USAGE, goAway: { timeLeft: '50s' } });
+			expect(onUsageMetadata).toHaveBeenCalledWith(USAGE);
+			expect(onGoAway).toHaveBeenCalledWith('50s');
+		});
+
+		it('carries the per-modality breakdown through unchanged', async () => {
+			const onUsageMetadata = vi.fn();
+			const cbs = await connectWith(onUsageMetadata);
+			const detailed = {
+				promptTokenCount: 9000,
+				promptTokensDetails: [
+					{ modality: 'AUDIO', tokenCount: 7000 },
+					{ modality: 'TEXT', tokenCount: 2000 },
+				],
+			};
+			cbs.onmessage({ usageMetadata: detailed });
+			expect(onUsageMetadata).toHaveBeenCalledWith(detailed);
+		});
+
+		it('does not fire when the message carries no usage', async () => {
+			const onUsageMetadata = vi.fn();
+			const cbs = await connectWith(onUsageMetadata);
+			cbs.onmessage({ serverContent: { turnComplete: true } });
+			expect(onUsageMetadata).not.toHaveBeenCalled();
+		});
+
+		// VoiceSession constructs the transport with an EMPTY callbacks object and
+		// wires property callbacks afterwards, so a constructor-only callback would
+		// be unreachable from the library's main consumer.
+		it('dispatches to the property callback, which is how VoiceSession wires events', async () => {
+			const transport = new GeminiLiveTransport({ apiKey: 'test-key' }, {});
+			await transport.connect();
+			const seen: LiveUsageMetadata[] = [];
+			transport.onUsageMetadata = (u) => seen.push(u);
+
+			const cbs = capturedConnectConfig.callbacks as Record<string, (msg: unknown) => void>;
+			cbs.onmessage({ usageMetadata: USAGE });
+
+			expect(seen).toEqual([USAGE]);
+		});
+
+		it('carries fields beyond the common two — cache and tool-use counts included', async () => {
+			const onUsageMetadata = vi.fn();
+			const cbs = await connectWith(onUsageMetadata);
+			const full = {
+				promptTokenCount: 1000,
+				cachedContentTokenCount: 400,
+				toolUsePromptTokenCount: 50,
+				thoughtsTokenCount: 25,
+				totalTokenCount: 1500,
+			};
+			cbs.onmessage({ usageMetadata: full });
+			expect(onUsageMetadata).toHaveBeenCalledWith(full);
 		});
 	});
 

@@ -19,6 +19,7 @@ import type {
 	LLMTransport,
 	LLMTransportError,
 	STTProvider,
+	TransportUsageMetadata,
 	UpstreamCounters,
 } from '../types/transport.js';
 import { BackgroundNotificationQueue } from './background-notification-queue.js';
@@ -108,6 +109,10 @@ export interface VoiceSessionConfig {
 	 *  `handleSupplied` on the attempt is what lets a consumer track resumed
 	 *  lineages without inferring them from log lines. */
 	onConnectionLifecycle?: (event: ConnectionLifecycleEvent) => void;
+	/** Server-reported token accounting, once per message that carries it.
+	 *  `promptTokenCount` is the standing prompt size — the signal for context
+	 *  growth. Fires only on transports that report usage. */
+	onUsageMetadata?: (usage: TransportUsageMetadata) => void;
 	/** With shadowSttProvider set: on divergence, SPEAK a self-correction — the
 	 *  model is told what the user actually said and answers the real question
 	 *  ("说错自纠", owner-selected option ① 2026-07-30). The shadow result
@@ -387,6 +392,9 @@ export class VoiceSession {
 		this.transport.onGroundingMetadata = (metadata) => this.handleGroundingMetadata(metadata);
 		if (config.onConnectionLifecycle) {
 			this.transport.onConnectionLifecycle = (event) => config.onConnectionLifecycle?.(event);
+		}
+		if (config.onUsageMetadata) {
+			this.transport.onUsageMetadata = (usage) => config.onUsageMetadata?.(usage);
 		}
 
 		// Wire STT: exactly one transcript path is active per session.

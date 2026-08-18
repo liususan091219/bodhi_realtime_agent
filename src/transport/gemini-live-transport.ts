@@ -1,6 +1,11 @@
 // SPDX-License-Identifier: MIT
 
-import { GoogleGenAI, type LiveServerMessage, type Session } from '@google/genai';
+import {
+	GoogleGenAI,
+	type LiveServerMessage,
+	type Session,
+	type UsageMetadata,
+} from '@google/genai';
 import { DEFAULT_CONNECT_TIMEOUT_MS, DEFAULT_RECONNECT_TIMEOUT_MS } from '../core/constants.js';
 import type { ToolDefinition } from '../types/tool.js';
 import type {
@@ -17,6 +22,7 @@ import type {
 	TransportDiagnostics,
 	TransportToolCall,
 	TransportToolResult,
+	TransportUsageMetadata,
 	UpstreamCounters,
 	UpstreamSlotCounters,
 } from '../types/transport.js';
@@ -61,6 +67,14 @@ export interface GeminiTransportConfig {
 }
 
 /** Callbacks fired by GeminiLiveTransport when server messages arrive. */
+/** Token accounting as reported by the Live server.
+ *
+ * Aliases the SDK's own schema so every field the server sends stays reachable
+ * — a hand-written subset would silently hide cache and tool-use counts.
+ * `promptTokenCount` is the standing prompt size, the field to watch for context
+ * growth; `totalTokenCount` adds response tokens and so does not describe it. */
+export type LiveUsageMetadata = UsageMetadata;
+
 export interface GeminiTransportCallbacks {
 	/** Gemini session setup is complete and ready for audio. */
 	onSetupComplete?(sessionId: string): void;
@@ -86,6 +100,9 @@ export interface GeminiTransportCallbacks {
 	onResumptionUpdate?(handle: string, resumable: boolean): void;
 	/** Connection-lifecycle facts (attempt / setup / close). */
 	onConnectionLifecycle?(event: ConnectionLifecycleEvent): void;
+	/** Server-reported token accounting. Fires on EVERY message carrying it,
+	 *  including ones that also carry serverContent, a tool call, or goAway. */
+	onUsageMetadata?(usage: LiveUsageMetadata): void;
 	/** Grounding metadata from Google Search results. */
 	onGroundingMetadata?(metadata: Record<string, unknown>): void;
 	/** Transport-level error. */
@@ -205,6 +222,10 @@ export class GeminiLiveTransport implements LLMTransport {
 	onClose?: (code?: number, reason?: string) => void;
 	onModelTurnStart?: () => void;
 	onGoAway?: (timeLeft: string) => void;
+	/** Property form — VoiceSession wires these, not the constructor callbacks.
+	 *  Typed to the neutral shape so it satisfies LLMTransport; the object passed
+	 *  is the full provider payload, castable to LiveUsageMetadata. */
+	onUsageMetadata?: (usage: TransportUsageMetadata) => void;
 	onResumptionUpdate?: (handle: string, resumable: boolean) => void;
 	onGroundingMetadata?: (metadata: Record<string, unknown>) => void;
 
@@ -799,6 +820,14 @@ export class GeminiLiveTransport implements LLMTransport {
 
 	// biome-ignore lint/suspicious/noExplicitAny: LiveServerMessage is a complex union type
 	private handleMessage(msg: any): void {
+		// BEFORE the branches below, which each return: usage rides along with
+		// serverContent and friends, so a branch of its own would miss most of it.
+		if (msg.usageMetadata) {
+			const usage = msg.usageMetadata as LiveUsageMetadata;
+			this.callbacks.onUsageMetadata?.(usage);
+			if (this.onUsageMetadata) this.onUsageMetadata(usage);
+		}
+
 		if (msg.setupComplete) {
 			// A connection that completed setup is a new generation; upstream
 			// counters reset with it — a new socket genuinely starts at zero.

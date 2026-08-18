@@ -69,6 +69,7 @@ export type {
 	ConnectionLifecycleEvent,
 	TransportCapabilities,
 	TransportDiagnostics,
+	TransportUsageMetadata,
 	UpstreamCounters,
 	UpstreamSlotCounters,
 	LLMTransportError,

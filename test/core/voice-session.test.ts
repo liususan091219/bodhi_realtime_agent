@@ -195,6 +195,53 @@ describe('VoiceSession', () => {
 		expect(events.map((e) => e.kind)).toEqual(['attempt', 'setup-ok']);
 	});
 
+	// The P1 this feature exists for: a caller using the DEFAULT constructor must
+	// be able to observe usage. Asserting on a concrete transport's property would
+	// pass while VoiceSession never wired it.
+	it('surfaces usage metadata through the default new VoiceSession(...) path', async () => {
+		const onUsageMetadata = vi.fn();
+		session = new VoiceSession({
+			sessionId: 'sess_usage',
+			userId: 'user_1',
+			apiKey: 'test-key',
+			agents: [createEchoAgent()],
+			initialAgent: 'echo',
+			port: 9891,
+			model: mockModel,
+			onUsageMetadata,
+		});
+
+		await session.start();
+		await new Promise((r) => setTimeout(r, 50));
+
+		const { _getMessageHandler } = await import('@google/genai');
+		const fire = (_getMessageHandler as unknown as () => (msg: unknown) => void)();
+		const usage = { promptTokenCount: 4096, totalTokenCount: 4200 };
+		fire({ usageMetadata: usage });
+
+		expect(onUsageMetadata).toHaveBeenCalledWith(usage);
+	});
+
+	it('does not wire usage metadata when no callback is supplied', async () => {
+		session = new VoiceSession({
+			sessionId: 'sess_usage_off',
+			userId: 'user_1',
+			apiKey: 'test-key',
+			agents: [createEchoAgent()],
+			initialAgent: 'echo',
+			port: 9892,
+			model: mockModel,
+		});
+
+		await session.start();
+		await new Promise((r) => setTimeout(r, 50));
+
+		const { _getMessageHandler } = await import('@google/genai');
+		const fire = (_getMessageHandler as unknown as () => (msg: unknown) => void)();
+		// Must not throw with nothing wired.
+		expect(() => fire({ usageMetadata: { promptTokenCount: 1 } })).not.toThrow();
+	});
+
 	it('creates with all components', () => {
 		session = new VoiceSession({
 			sessionId: 'sess_1',
