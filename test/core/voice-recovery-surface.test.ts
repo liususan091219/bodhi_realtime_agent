@@ -7,19 +7,23 @@
 
 import type { LanguageModelV1 } from 'ai';
 import { afterEach, describe, expect, it, vi } from 'vitest';
+import { z } from 'zod';
 import { RECOVERY_CAPABILITIES, VoiceSession } from '../../src/core/voice-session.js';
 import type { MainAgent } from '../../src/types/agent.js';
+import type { ConnectionLifecycleEvent, STTProvider } from '../../src/types/transport.js';
 
 vi.mock('@google/genai', () => {
+	const connectCalls: Array<Record<string, unknown>> = [];
 	let messageHandler: ((msg: unknown) => void) | null = null;
 	let mockSession: Record<string, ReturnType<typeof vi.fn>> | null = null;
 	return {
 		GoogleGenAI: vi.fn().mockImplementation(() => ({
 			live: {
 				connect: vi.fn(async (params: Record<string, unknown>) => {
+					connectCalls.push(params);
 					const cbs = params.callbacks as Record<string, (...args: unknown[]) => void>;
 					messageHandler = cbs.onmessage as (msg: unknown) => void;
-					setTimeout(() => messageHandler?.({ setupComplete: { sessionId: 'gs' } }), 5);
+					setTimeout(() => cbs.onmessage?.({ setupComplete: { sessionId: 'gs' } }), 5);
 					mockSession = {
 						sendRealtimeInput: vi.fn(),
 						sendToolResponse: vi.fn(),
@@ -32,26 +36,35 @@ vi.mock('@google/genai', () => {
 		})),
 		_getMessageHandler: () => messageHandler,
 		_getMockSession: () => mockSession,
+		_getConnectCalls: () => connectCalls,
 	};
 });
 vi.mock('ai', () => ({ generateText: vi.fn(async () => ({ text: 'ok' })) }));
 
 const mockModel = { modelId: 'test-model' } as unknown as LanguageModelV1;
-const echo = (): MainAgent => ({ name: 'echo', instructions: 'echo', tools: [] });
+const echo = (overrides: Partial<MainAgent> = {}): MainAgent => ({
+	name: 'echo',
+	instructions: 'echo',
+	tools: [],
+	...overrides,
+});
 
 async function startSession(
 	port: number,
 	hooks: Record<string, unknown> = {},
+	extraConfig: Record<string, unknown> = {},
+	agent: MainAgent = echo(),
 ): Promise<VoiceSession> {
 	const s = new VoiceSession({
 		sessionId: 'sess_rs',
 		userId: 'u',
 		apiKey: 'k',
-		agents: [echo()],
+		agents: [agent],
 		initialAgent: 'echo',
 		port,
 		model: mockModel,
 		hooks,
+		...extraConfig,
 	});
 	await s.start();
 	await new Promise((r) => setTimeout(r, 40));
@@ -61,6 +74,19 @@ const fire = async (): Promise<(m: unknown) => void> => {
 	const { _getMessageHandler } = await import('@google/genai');
 	return (_getMessageHandler as unknown as () => (m: unknown) => void)();
 };
+const connectCalls = async (): Promise<Array<Record<string, unknown>>> => {
+	const { _getConnectCalls } = await import('@google/genai');
+	return (_getConnectCalls as unknown as () => Array<Record<string, unknown>>)();
+};
+const fakeStt = (): STTProvider =>
+	({
+		configure: vi.fn(),
+		start: vi.fn(async () => {}),
+		stop: vi.fn(async () => {}),
+		feedAudio: vi.fn(),
+		commit: vi.fn(),
+		handleInterrupted: vi.fn(),
+	}) as unknown as STTProvider;
 
 describe('recovery surface', () => {
 	let session: VoiceSession | null = null;
@@ -79,14 +105,56 @@ describe('recovery surface', () => {
 		expect(session.getRecoveryCapabilities()).toEqual(RECOVERY_CAPABILITIES);
 	});
 
-	it('publishes generation-fenced turn.start on the first model part of a turn', async () => {
+	it('exports the recovery API through the package barrel', async () => {
+		const barrel = (await import('../../src/index.js')) as Record<string, unknown>;
+		expect(barrel.RECOVERY_CAPABILITIES).toBe(RECOVERY_CAPABILITIES);
+	});
+
+	it('degrades the descriptor and refuses recoverUpstream on a transport without the primitives', async () => {
+		const bare = {
+			audioFormat: { inputSampleRate: 16000, outputSampleRate: 24000, bitDepth: 16, channels: 1 },
+			connect: vi.fn(async () => {}),
+			disconnect: vi.fn(async () => {}),
+			reconnect: vi.fn(async () => {}),
+			updateSession: vi.fn(),
+			sendContent: vi.fn(),
+			sendToolResult: vi.fn(),
+			sendRealtimeAudio: vi.fn(),
+			sendAudio: vi.fn(),
+		};
+		const s = new VoiceSession({
+			sessionId: 'sess_bare',
+			userId: 'u',
+			apiKey: 'k',
+			agents: [echo()],
+			initialAgent: 'echo',
+			port: 9944,
+			model: mockModel,
+			hooks: {},
+			transport: bare as never,
+		});
+		const caps = s.getRecoveryCapabilities();
+		expect(caps.recoverUpstream).toBe(false);
+		expect(caps.transportGenerations).toBe(false);
+		expect(() =>
+			s.recoverUpstream({
+				reason: 'active-silence',
+				skipContextInjection: true,
+				holdSyntheticUntilFreshSpeech: false,
+			}),
+		).toThrow(/recovery primitives/);
+	});
+
+	it('publishes turn.start carrying the post-setup transport generation, once per turn', async () => {
 		session = await startSession(9932);
 		const events: unknown[] = [];
 		session.eventBus.subscribe('turn.start', (e: unknown) => events.push(e));
 		(await fire())({ serverContent: { modelTurn: { parts: [{ inlineData: { data: 'AAAA' } }] } } });
 		expect(events.length).toBe(1);
 		const ev = events[0] as { transportGeneration: number };
-		expect(typeof ev.transportGeneration).toBe('number');
+		// First dial: transportGeneration domain is the setup-ok counter (1),
+		// NOT the dial counter — the two diverge after a recovery.
+		expect(ev.transportGeneration).toBe(1);
 		// Same turn: no duplicate publication.
 		(await fire())({ serverContent: { modelTurn: { parts: [{ inlineData: { data: 'BBBB' } }] } } });
 		expect(events.length).toBe(1);
@@ -128,6 +196,88 @@ describe('recovery surface', () => {
 		sendSpy.mockRestore();
 	});
 
+	it('attemptEpoch matches the recovery dial lifecycle; turn.start correlates with setup-ok', async () => {
+		const lifecycle: ConnectionLifecycleEvent[] = [];
+		session = await startSession(
+			9938,
+			{},
+			{
+				onConnectionLifecycle: (e: ConnectionLifecycleEvent) => lifecycle.push(e),
+			},
+		);
+		const r = session.recoverUpstream({
+			reason: 'active-silence',
+			skipContextInjection: true,
+			holdSyntheticUntilFreshSpeech: false,
+		});
+		await r.activated;
+		// The recovery dial's attempt event carries att_<attemptEpoch> — the
+		// returned epoch and the lifecycle stream must agree, or the reducer
+		// can never correlate its restart with the transport's activation.
+		const attempts = lifecycle.filter((e) => e.kind === 'attempt');
+		const recoveryAttempt = attempts[attempts.length - 1] as { connectAttemptId: string };
+		expect(recoveryAttempt.connectAttemptId).toBe(`att_${r.attemptEpoch}`);
+		const setupOks = lifecycle.filter((e) => e.kind === 'setup-ok') as Array<{
+			connectAttemptId: string;
+			transportGeneration: number;
+		}>;
+		const recoverySetup = setupOks[setupOks.length - 1];
+		expect(recoverySetup.connectAttemptId).toBe(`att_${r.attemptEpoch}`);
+		// turn.start after recovery carries the SAME transport generation the
+		// setup-ok minted — one authoritative counter, not the dial counter.
+		const events: Array<{ transportGeneration?: number }> = [];
+		session.eventBus.subscribe('turn.start', (e: unknown) =>
+			events.push(e as { transportGeneration?: number }),
+		);
+		(await fire())({ serverContent: { modelTurn: { parts: [{ inlineData: { data: 'AAAA' } }] } } });
+		expect(events.length).toBe(1);
+		expect(events[0].transportGeneration).toBe(recoverySetup.transportGeneration);
+	});
+
+	it('recovery clears the transport-side resumption handle: the redial sends none', async () => {
+		session = await startSession(9939);
+		// Server grants a resumable handle — the transport stores it and would
+		// offer it on the next dial.
+		(await fire())({ sessionResumptionUpdate: { newHandle: 'h_stale', resumable: true } });
+		const before = (await connectCalls()).length;
+		const r = session.recoverUpstream({
+			reason: 'active-silence',
+			skipContextInjection: true,
+			holdSyntheticUntilFreshSpeech: false,
+		});
+		await r.activated;
+		const calls = await connectCalls();
+		expect(calls.length).toBe(before + 1);
+		const cfg = calls[before].config as { sessionResumption?: { handle?: string } };
+		// A recovery redial must NOT resume the wedged server-side turn.
+		expect(cfg.sessionResumption?.handle).toBeUndefined();
+	});
+
+	it('a reentrant recoverUpstream from a boundary subscriber gets the latched result', async () => {
+		session = await startSession(9940);
+		const boundaries: unknown[] = [];
+		let reentrant: unknown = null;
+		session.eventBus.subscribe('session.reconnectBoundary', (e: unknown) => {
+			boundaries.push(e);
+			reentrant ??= session?.recoverUpstream({
+				reason: 'active-silence',
+				skipContextInjection: true,
+				holdSyntheticUntilFreshSpeech: false,
+			});
+		});
+		const before = (await connectCalls()).length;
+		const r = session.recoverUpstream({
+			reason: 'active-silence',
+			skipContextInjection: true,
+			holdSyntheticUntilFreshSpeech: false,
+		});
+		expect(reentrant).toBe(r);
+		expect(boundaries.length).toBe(1);
+		await r.activated;
+		// Exactly one recovery dial — the reentrant call must not start a second.
+		expect((await connectCalls()).length).toBe(before + 1);
+	});
+
 	it('recoverUpstream is single-flight while a dial is pending', async () => {
 		session = await startSession(9934);
 		const a = session.recoverUpstream({
@@ -144,7 +294,7 @@ describe('recovery surface', () => {
 		await a.activated;
 	});
 
-	it('reconnect boundary is idempotent per epoch (one event, replays are no-ops)', async () => {
+	it('reconnect boundary is idempotent per epoch and rejects stale replays', async () => {
 		session = await startSession(9935);
 		const boundaries: unknown[] = [];
 		session.eventBus.subscribe('session.reconnectBoundary', (e: unknown) => boundaries.push(e));
@@ -154,9 +304,12 @@ describe('recovery surface', () => {
 		expect(boundaries.length).toBe(1);
 		priv.beginReconnectBoundary('test', 8);
 		expect(boundaries.length).toBe(2);
+		// A stale generation arriving AFTER a newer one must not re-emit.
+		priv.beginReconnectBoundary('test', 7);
+		expect(boundaries.length).toBe(2);
 	});
 
-	it('synthetic hold: queued notifications stay held until fresh user speech, then release once', async () => {
+	it('synthetic hold: queued notifications stay held until real input transcription, then drain', async () => {
 		session = await startSession(9936);
 		const sendSpy = vi
 			.spyOn(
@@ -180,15 +333,135 @@ describe('recovery surface', () => {
 		// Nothing synthetic may reach the transport while held.
 		expect(JSON.stringify(sendSpy.mock.calls).includes('held?')).toBe(false);
 
-		// Fresh user speech (input transcription) releases the hold…
-		const priv = session as unknown as { handleUserSpeechEvidence: () => void };
-		priv.handleUserSpeechEvidence();
+		// Fresh user speech through the REAL path (built-in input transcription)
+		// releases the hold…
+		(await fire())({ serverContent: { inputTranscription: { text: 'hello again' } } });
 		expect(session.isSyntheticHoldActive()).toBe(false);
-		// …and the queue can drain through its normal turn-complete path.
+		// …and the queue drains through its normal turn-complete path.
 		session.notificationQueue.onTurnComplete();
 		expect(JSON.stringify(sendSpy.mock.calls).includes('held?')).toBe(true);
 		expect(sendSpy.mock.calls.length).toBeGreaterThan(heldCalls);
 		sendSpy.mockRestore();
+	});
+
+	it('external STT finals release the hold', async () => {
+		const stt = fakeStt();
+		session = await startSession(9941, {}, { sttProvider: stt });
+		const r = session.recoverUpstream({
+			reason: 'active-silence',
+			skipContextInjection: true,
+			holdSyntheticUntilFreshSpeech: true,
+		});
+		await r.activated;
+		expect(session.isSyntheticHoldActive()).toBe(true);
+		(stt as { onTranscript?: (t: string, turnId?: number) => void }).onTranscript?.('hi there');
+		expect(session.isSyntheticHoldActive()).toBe(false);
+	});
+
+	it('VAD barge-in (interrupted) releases the hold', async () => {
+		session = await startSession(9942);
+		const r = session.recoverUpstream({
+			reason: 'active-silence',
+			skipContextInjection: true,
+			holdSyntheticUntilFreshSpeech: true,
+		});
+		await r.activated;
+		expect(session.isSyntheticHoldActive()).toBe(true);
+		(await fire())({ serverContent: { interrupted: true } });
+		expect(session.isSyntheticHoldActive()).toBe(false);
+	});
+
+	it('typed text input releases the hold', async () => {
+		session = await startSession(9943);
+		const sendSpy = vi
+			.spyOn(
+				session.transport as unknown as { sendContent: (c: unknown, t: boolean) => void },
+				'sendContent',
+			)
+			.mockImplementation(() => {});
+		const r = session.recoverUpstream({
+			reason: 'active-silence',
+			skipContextInjection: true,
+			holdSyntheticUntilFreshSpeech: true,
+		});
+		await r.activated;
+		expect(session.isSyntheticHoldActive()).toBe(true);
+		(session as unknown as { handleTextInput: (t: string) => void }).handleTextInput('typed');
+		expect(session.isSyntheticHoldActive()).toBe(false);
+		sendSpy.mockRestore();
+	});
+
+	it('the hold gates greetings, directive reinforcement and reconnect context injection', async () => {
+		session = await startSession(9945, {}, {}, echo({ greeting: 'Greet the user warmly.' }));
+		const sent: unknown[] = [];
+		const sendSpy = vi
+			.spyOn(
+				session.transport as unknown as { sendContent: (c: unknown, t: boolean) => void },
+				'sendContent',
+			)
+			.mockImplementation((c: unknown) => {
+				sent.push(c);
+			});
+		const r = session.recoverUpstream({
+			reason: 'active-silence',
+			skipContextInjection: true,
+			holdSyntheticUntilFreshSpeech: true,
+		});
+		await r.activated;
+		expect(session.isSyntheticHoldActive()).toBe(true);
+		const priv = session as unknown as {
+			sendGreeting: () => void;
+			reinforceDirectives: () => void;
+			handleClientConnected: () => void;
+			directiveManager: { set: (k: string, v: string, s: string) => void };
+			turnId: number;
+		};
+		priv.sendGreeting();
+		priv.directiveManager.set('pace', 'slow', 'session');
+		priv.reinforceDirectives();
+		priv.turnId = 3;
+		priv.handleClientConnected();
+		const text = JSON.stringify(sent);
+		expect(text.includes('Greet')).toBe(false);
+		expect(text.includes('pace')).toBe(false);
+		expect(text.includes('reconnected')).toBe(false);
+		sendSpy.mockRestore();
+	});
+
+	it('a tool result issued before recovery is dropped, not sent into the replacement session', async () => {
+		let resolveTool!: (v: string) => void;
+		const toolDone = new Promise<string>((res) => {
+			resolveTool = res;
+		});
+		const agent = echo({
+			tools: [
+				{
+					name: 'slow_tool',
+					description: 'slow',
+					parameters: z.object({}),
+					execution: 'inline' as const,
+					execute: async () => toolDone,
+				} as never,
+			],
+		});
+		session = await startSession(9946, {}, {}, agent);
+		(await fire())({
+			toolCall: { functionCalls: [{ id: 'call_old', name: 'slow_tool', args: {} }] },
+		});
+		const r = session.recoverUpstream({
+			reason: 'active-silence',
+			skipContextInjection: true,
+			holdSyntheticUntilFreshSpeech: false,
+		});
+		await r.activated;
+		const { _getMockSession } = await import('@google/genai');
+		const replacement = (
+			_getMockSession as unknown as () => { sendToolResponse: ReturnType<typeof vi.fn> }
+		)();
+		resolveTool('late result');
+		await new Promise((res) => setTimeout(res, 20));
+		// The stale-generation completion must not reach the new session.
+		expect(replacement.sendToolResponse).not.toHaveBeenCalled();
 	});
 
 	it('a late incumbent close after the replacement is ACTIVE is a no-op', async () => {
@@ -206,5 +479,21 @@ describe('recovery surface', () => {
 		await r.incumbentClosed;
 		expect(incumbent.close).toHaveBeenCalled();
 		expect(session.sessionManager.state).toBe('ACTIVE');
+	});
+
+	it('incumbentClosed reports forced when the incumbent close throws', async () => {
+		session = await startSession(9947);
+		const { _getMockSession } = await import('@google/genai');
+		const incumbent = (_getMockSession as unknown as () => { close: ReturnType<typeof vi.fn> })();
+		incumbent.close.mockImplementation(() => {
+			throw new Error('socket already dead');
+		});
+		const r = session.recoverUpstream({
+			reason: 'active-silence',
+			skipContextInjection: true,
+			holdSyntheticUntilFreshSpeech: false,
+		});
+		await expect(r.incumbentClosed).resolves.toBe('forced');
+		await r.activated;
 	});
 });
