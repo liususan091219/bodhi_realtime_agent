@@ -3,6 +3,7 @@
 import {
 	GoogleGenAI,
 	type LiveServerMessage,
+	type MediaResolution,
 	type Session,
 	type UsageMetadata,
 } from '@google/genai';
@@ -46,6 +47,11 @@ export interface GeminiTransportConfig {
 	/** Context-window compression. Supply the object with NO thresholds to enable
 	 *  it with the server's defaults (trigger 80% of the model limit, target half). */
 	compressionConfig?: { triggerTokens?: number; targetTokens?: number };
+	/** Session-wide media token cost for video/image input. LOW = 64 tokens per
+	 *  frame. Applies to every REALTIME-INPUT image this transport sends —
+	 *  realtime input has no per-send override. (Client-content Parts do, via
+	 *  Part.mediaResolution, but this transport sends images as realtime input.) */
+	mediaResolution?: 'MEDIA_RESOLUTION_LOW' | 'MEDIA_RESOLUTION_MEDIUM' | 'MEDIA_RESOLUTION_HIGH';
 	/** Enable Gemini's built-in Google Search grounding. */
 	googleSearch?: boolean;
 	/** Enable server-side transcription of user audio input (default: true). */
@@ -299,6 +305,10 @@ export class GeminiLiveTransport implements LLMTransport {
 			if (triggerTokens !== undefined) compression.triggerTokens = String(triggerTokens);
 			if (targetTokens !== undefined) compression.slidingWindow.targetTokens = String(targetTokens);
 			connectConfig.contextWindowCompression = compression;
+		}
+
+		if (this.config.mediaResolution) {
+			connectConfig.mediaResolution = this.config.mediaResolution as MediaResolution;
 		}
 
 		if (this.config.vadConfig) {

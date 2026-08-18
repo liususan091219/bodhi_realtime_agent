@@ -11,11 +11,13 @@ import type { STTProvider } from '../../src/types/transport.js';
 vi.mock('@google/genai', () => {
 	let messageHandler: ((msg: unknown) => void) | null = null;
 	let mockSession: Record<string, ReturnType<typeof vi.fn>> | null = null;
+	let connectParams: Record<string, unknown> | null = null;
 
 	return {
 		GoogleGenAI: vi.fn().mockImplementation(() => ({
 			live: {
 				connect: vi.fn(async (params: Record<string, unknown>) => {
+					connectParams = params;
 					const cbs = params.callbacks as Record<string, (...args: unknown[]) => void>;
 					messageHandler = cbs.onmessage as (msg: unknown) => void;
 					// Fire setupComplete so connect() resolves (it awaits this)
@@ -32,6 +34,7 @@ vi.mock('@google/genai', () => {
 		})),
 		_getMessageHandler: () => messageHandler,
 		_getMockSession: () => mockSession,
+		_getConnectParams: () => connectParams,
 	};
 });
 
@@ -240,6 +243,28 @@ describe('VoiceSession', () => {
 		const fire = (_getMessageHandler as unknown as () => (msg: unknown) => void)();
 		// Must not throw with nothing wired.
 		expect(() => fire({ usageMetadata: { promptTokenCount: 1 } })).not.toThrow();
+	});
+
+	// Reachability, not dispatch: the config option must arrive in the actual
+	// live.connect() call made by the default VoiceSession path.
+	it('passes mediaResolution from VoiceSessionConfig through to live.connect', async () => {
+		session = new VoiceSession({
+			sessionId: 'sess_mr',
+			userId: 'user_1',
+			apiKey: 'test-key',
+			agents: [createEchoAgent()],
+			initialAgent: 'echo',
+			port: 9893,
+			model: mockModel,
+			mediaResolution: 'MEDIA_RESOLUTION_LOW',
+		});
+		await session.start();
+		await new Promise((r) => setTimeout(r, 50));
+
+		const { _getConnectParams } = await import('@google/genai');
+		const params = (_getConnectParams as unknown as () => Record<string, unknown>)();
+		const cfg = params.config as Record<string, unknown>;
+		expect(cfg.mediaResolution).toBe('MEDIA_RESOLUTION_LOW');
 	});
 
 	it('creates with all components', () => {

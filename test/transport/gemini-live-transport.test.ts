@@ -653,6 +653,25 @@ describe('GeminiLiveTransport', () => {
 		});
 	});
 
+	describe('media resolution', () => {
+		it('passes mediaResolution through to the connect config', async () => {
+			const transport = new GeminiLiveTransport(
+				{ apiKey: 'test-key', mediaResolution: 'MEDIA_RESOLUTION_LOW' },
+				{},
+			);
+			await transport.connect();
+			const cfg = capturedConnectConfig.config as Record<string, unknown>;
+			expect(cfg.mediaResolution).toBe('MEDIA_RESOLUTION_LOW');
+		});
+
+		it('omits mediaResolution entirely when not configured — server default applies', async () => {
+			const transport = new GeminiLiveTransport({ apiKey: 'test-key' }, {});
+			await transport.connect();
+			const cfg = capturedConnectConfig.config as Record<string, unknown>;
+			expect(Object.hasOwn(cfg, 'mediaResolution')).toBe(false);
+		});
+	});
+
 	describe('sendAudio', () => {
 		it('calls session.sendRealtimeInput with correct format', async () => {
 			const transport = new GeminiLiveTransport({ apiKey: 'test-key' }, {});

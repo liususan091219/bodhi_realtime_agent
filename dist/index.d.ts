@@ -2050,6 +2050,11 @@ interface VoiceSessionConfig {
         triggerTokens?: number;
         targetTokens?: number;
     };
+    /** Session-wide media token cost for video/image input (Gemini only). LOW =
+     *  64 tokens per frame. Applies to every realtime-input image on the session,
+     *  one-shots included — realtime input has no per-send override. (Client-
+     *  content Parts can override per-part; this transport does not send those.) */
+    mediaResolution?: 'MEDIA_RESOLUTION_LOW' | 'MEDIA_RESOLUTION_MEDIUM' | 'MEDIA_RESOLUTION_HIGH';
     /** Gemini automatic-VAD tuning — passed through to the Live API as
      *  realtimeInputConfig.automaticActivityDetection. Shorten silenceDurationMs
      *  to make end-of-turn detection (and thus the bot's reply) faster. */
@@ -2466,6 +2471,11 @@ interface GeminiTransportConfig {
         triggerTokens?: number;
         targetTokens?: number;
     };
+    /** Session-wide media token cost for video/image input. LOW = 64 tokens per
+     *  frame. Applies to every REALTIME-INPUT image this transport sends —
+     *  realtime input has no per-send override. (Client-content Parts do, via
+     *  Part.mediaResolution, but this transport sends images as realtime input.) */
+    mediaResolution?: 'MEDIA_RESOLUTION_LOW' | 'MEDIA_RESOLUTION_MEDIUM' | 'MEDIA_RESOLUTION_HIGH';
     /** Enable Gemini's built-in Google Search grounding. */
     googleSearch?: boolean;
     /** Enable server-side transcription of user audio input (default: true). */
