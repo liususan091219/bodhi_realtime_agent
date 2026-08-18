@@ -837,6 +837,48 @@ describe('GeminiLiveTransport', () => {
 			cbs.onmessage({ usageMetadata: full });
 			expect(onUsageMetadata).toHaveBeenCalledWith(full);
 		});
+
+		it('a throwing observer does not suppress the co-occurring turn', async () => {
+			const onAudioOutput = vi.fn();
+			const onGoAway = vi.fn();
+			const onUsageMetadata = vi.fn(() => {
+				throw new Error('metrics failed');
+			});
+			const transport = new GeminiLiveTransport(
+				{ apiKey: 'test-key' },
+				{ onAudioOutput, onGoAway, onUsageMetadata },
+			);
+			await transport.connect();
+			const cbs = capturedConnectConfig.callbacks as Record<string, (msg: unknown) => void>;
+
+			// ONE message carrying usage AND the payload it rides with.
+			cbs.onmessage({
+				usageMetadata: USAGE,
+				serverContent: { modelTurn: { parts: [{ inlineData: { data: 'AUDIO' } }] } },
+			});
+			cbs.onmessage({ usageMetadata: USAGE, goAway: { timeLeft: '30s' } });
+
+			expect(onUsageMetadata).toHaveBeenCalledTimes(2);
+			expect(onAudioOutput).toHaveBeenCalledWith('AUDIO');
+			expect(onGoAway).toHaveBeenCalledWith('30s');
+		});
+
+		it('a throwing property-form observer is isolated too', async () => {
+			const onAudioOutput = vi.fn();
+			const transport = new GeminiLiveTransport({ apiKey: 'test-key' }, { onAudioOutput });
+			await transport.connect();
+			transport.onUsageMetadata = () => {
+				throw new Error('metrics failed');
+			};
+			const cbs = capturedConnectConfig.callbacks as Record<string, (msg: unknown) => void>;
+
+			cbs.onmessage({
+				usageMetadata: USAGE,
+				serverContent: { modelTurn: { parts: [{ inlineData: { data: 'AUDIO' } }] } },
+			});
+
+			expect(onAudioOutput).toHaveBeenCalledWith('AUDIO');
+		});
 	});
 
 	describe('message dispatch', () => {

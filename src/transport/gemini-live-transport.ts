@@ -818,14 +818,24 @@ export class GeminiLiveTransport implements LLMTransport {
 		}
 	}
 
+	/** Run an observer without letting its failure reach dispatch. Usage rides on
+	 *  the SAME message as audio and goAway, so a throwing hook would drop them. */
+	private notifyObserver(label: string, fn: () => void): void {
+		try {
+			fn();
+		} catch (err) {
+			console.warn(`[GeminiLiveTransport] ${label} observer threw; dispatch continues:`, err);
+		}
+	}
+
 	// biome-ignore lint/suspicious/noExplicitAny: LiveServerMessage is a complex union type
 	private handleMessage(msg: any): void {
 		// BEFORE the branches below, which each return: usage rides along with
 		// serverContent and friends, so a branch of its own would miss most of it.
 		if (msg.usageMetadata) {
 			const usage = msg.usageMetadata as LiveUsageMetadata;
-			this.callbacks.onUsageMetadata?.(usage);
-			if (this.onUsageMetadata) this.onUsageMetadata(usage);
+			this.notifyObserver('onUsageMetadata', () => this.callbacks.onUsageMetadata?.(usage));
+			this.notifyObserver('onUsageMetadata', () => this.onUsageMetadata?.(usage));
 		}
 
 		if (msg.setupComplete) {
