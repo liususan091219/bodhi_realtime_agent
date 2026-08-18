@@ -49,5 +49,11 @@ export type { ToolCallRouterDeps } from './tool-call-router.js';
 export { TranscriptManager } from './transcript-manager.js';
 export type { TranscriptSink } from './transcript-manager.js';
 
-export { VoiceSession } from './voice-session.js';
-export type { VoiceSessionConfig, VoiceSessionDiagnostics } from './voice-session.js';
+export { RECOVERY_CAPABILITIES, VoiceSession } from './voice-session.js';
+export type {
+	RecoverUpstreamArgs,
+	RecoverUpstreamResult,
+	RecoveryCapabilities,
+	VoiceSessionConfig,
+	VoiceSessionDiagnostics,
+} from './voice-session.js';

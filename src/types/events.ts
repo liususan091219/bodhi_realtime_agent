@@ -37,7 +37,15 @@ export interface EventPayloadMap {
 	'tool.cancel': { sessionId: string; toolCallIds: string[] };
 
 	// Turn events
-	'turn.start': { sessionId: string; turnId: string };
+	// transportGeneration is the POST-SETUP counter (correlates with lifecycle
+	// setup-ok); attemptEpoch is the DIAL counter recoverUpstream returns.
+	'turn.start': {
+		sessionId: string;
+		turnId: string;
+		transportGeneration?: number;
+		attemptEpoch?: number;
+	};
+	'session.reconnectBoundary': { sessionId: string; reason: string; transportGeneration: number };
 	'turn.end': { sessionId: string; turnId: string };
 	'turn.interrupted': { sessionId: string; turnId: string };
 

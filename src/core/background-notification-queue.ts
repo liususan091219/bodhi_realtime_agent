@@ -49,6 +49,14 @@ export class BackgroundNotificationQueue {
 	 * the notification is silently skipped to prevent race conditions where a
 	 * background task completes synchronously before audio generation begins.
 	 */
+	/** While held (post-recovery synthetic-input hold), nothing synthetic may
+	 *  reach the transport — everything queues until the hold is released. */
+	private held = false;
+
+	setHeld(held: boolean): void {
+		this.held = held;
+	}
+
 	sendOrQueue(turns: Turn[], turnComplete: boolean, options?: SendOrQueueOptions): void {
 		const priority = options?.priority ?? 'normal';
 		const toolCallId = options?.toolCallId;
@@ -62,6 +70,13 @@ export class BackgroundNotificationQueue {
 		// Mark as sent/queued to prevent duplicates
 		if (toolCallId) {
 			this.sentNotifications.add(toolCallId);
+		}
+
+		if (this.held) {
+			this.log('Synthetic hold active — queuing notification until fresh user speech');
+			if (priority === 'high') this.queue.unshift({ turns, turnComplete, priority });
+			else this.queue.push({ turns, turnComplete, priority });
+			return;
 		}
 
 		if (priority === 'high') {
@@ -121,6 +136,7 @@ export class BackgroundNotificationQueue {
 	}
 
 	private flushOne(): void {
+		if (this.held) return;
 		const notification = this.queue.shift();
 		if (notification) {
 			this.log(`Flushing queued background notification (${this.queue.length} remaining)`);

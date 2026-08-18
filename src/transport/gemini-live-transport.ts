@@ -408,9 +408,11 @@ export class GeminiLiveTransport implements LLMTransport {
 	 */
 	async reconnect(stateOrHandle?: ReconnectState | string): Promise<void> {
 		const timeoutMs = this.config.reconnectTimeoutMs ?? DEFAULT_RECONNECT_TIMEOUT_MS;
+		// Generation-fenced force-kill: if a recovery replaced the session while
+		// this timer was pending, nulling would kill the replacement instead.
+		const timerGen = this.dialGen;
 		const timer = setTimeout(() => {
-			// Force-kill the stale session so disconnect() unblocks
-			this.session = null;
+			if (this.dialGen === timerGen) this.session = null;
 		}, timeoutMs);
 
 		try {
@@ -434,9 +436,55 @@ export class GeminiLiveTransport implements LLMTransport {
 		}
 	}
 
+	get currentDialGen(): number {
+		return this.dialGen;
+	}
+
+	/** The post-setup generation counter — the one lifecycle setup-ok and
+	 *  generation-close events carry. Distinct from the dial counter, which
+	 *  also advances on failed and aborted dials. */
+	get currentTransportGeneration(): number {
+		return this.transportGeneration;
+	}
+
+	/** Synchronously strand the incumbent connection: bump the dial generation
+	 *  (its callbacks go stale immediately — no state write can land later),
+	 *  detach the session object BEFORE any await so a late-resolving close can
+	 *  never null a replacement, and discard the resumption handle — a recovery
+	 *  redial must never resume the wedged server-side turn. Returns the
+	 *  bounded async cleanup: 'closed' when close() completed, 'forced' on
+	 *  timeout or close error. */
+	abortIncumbent(): Promise<'closed' | 'forced'> {
+		this.dialGen += 1;
+		const incumbent = this.session;
+		this.session = null;
+		this._modelTurnStarted = false;
+		this.config.resumptionHandle = undefined;
+		if (!incumbent) return Promise.resolve('closed');
+		return new Promise((resolve) => {
+			const deadline = setTimeout(() => resolve('forced'), 5_000);
+			void Promise.resolve()
+				.then(() => incumbent.close())
+				.then(
+					() => {
+						clearTimeout(deadline);
+						resolve('closed');
+					},
+					() => {
+						clearTimeout(deadline);
+						resolve('forced');
+					},
+				);
+		});
+	}
+
 	async disconnect(): Promise<void> {
 		this._modelTurnStarted = false;
-		if (this.session) {
+		// Capture the incumbent before awaiting: a recovery can replace
+		// this.session while close() is in flight, and the replacement must
+		// survive this call untouched.
+		const incumbent = this.session;
+		if (incumbent) {
 			// The websocket's own onclose usually lands after the next dial has
 			// bumped the fence, so a locally initiated close would never emit.
 			// Emit deterministically here; the flag suppresses a late duplicate.
@@ -451,11 +499,11 @@ export class GeminiLiveTransport implements LLMTransport {
 				});
 			}
 			try {
-				await this.session.close();
+				await incumbent.close();
 			} catch {
 				// Ignore close errors
 			}
-			this.session = null;
+			if (this.session === incumbent) this.session = null;
 		}
 	}
 

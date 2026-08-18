@@ -66,6 +66,7 @@ __export(index_exports, {
   MemoryDistiller: () => MemoryDistiller,
   MemoryError: () => MemoryError,
   OpenAIRealtimeTransport: () => OpenAIRealtimeTransport,
+  RECOVERY_CAPABILITIES: () => RECOVERY_CAPABILITIES,
   SessionCompletedError: () => SessionCompletedError,
   SessionError: () => SessionError,
   SessionManager: () => SessionManager,
@@ -788,6 +789,12 @@ var BackgroundNotificationQueue = class {
    * the notification is silently skipped to prevent race conditions where a
    * background task completes synchronously before audio generation begins.
    */
+  /** While held (post-recovery synthetic-input hold), nothing synthetic may
+   *  reach the transport — everything queues until the hold is released. */
+  held = false;
+  setHeld(held) {
+    this.held = held;
+  }
   sendOrQueue(turns, turnComplete, options) {
     const priority = options?.priority ?? "normal";
     const toolCallId = options?.toolCallId;
@@ -797,6 +804,12 @@ var BackgroundNotificationQueue = class {
     }
     if (toolCallId) {
       this.sentNotifications.add(toolCallId);
+    }
+    if (this.held) {
+      this.log("Synthetic hold active \u2014 queuing notification until fresh user speech");
+      if (priority === "high") this.queue.unshift({ turns, turnComplete, priority });
+      else this.queue.push({ turns, turnComplete, priority });
+      return;
     }
     if (priority === "high") {
       if (this.audioReceived && !this.messageTruncation) {
@@ -844,6 +857,7 @@ var BackgroundNotificationQueue = class {
     this.sentNotifications.clear();
   }
   flushOne() {
+    if (this.held) return;
     const notification = this.queue.shift();
     if (notification) {
       this.log(`Flushing queued background notification (${this.queue.length} remaining)`);
@@ -2821,8 +2835,9 @@ var GeminiLiveTransport = class {
    */
   async reconnect(stateOrHandle) {
     const timeoutMs = this.config.reconnectTimeoutMs ?? DEFAULT_RECONNECT_TIMEOUT_MS;
+    const timerGen = this.dialGen;
     const timer = setTimeout(() => {
-      this.session = null;
+      if (this.dialGen === timerGen) this.session = null;
     }, timeoutMs);
     try {
       await this.disconnect();
@@ -2837,9 +2852,47 @@ var GeminiLiveTransport = class {
       clearTimeout(timer);
     }
   }
+  get currentDialGen() {
+    return this.dialGen;
+  }
+  /** The post-setup generation counter — the one lifecycle setup-ok and
+   *  generation-close events carry. Distinct from the dial counter, which
+   *  also advances on failed and aborted dials. */
+  get currentTransportGeneration() {
+    return this.transportGeneration;
+  }
+  /** Synchronously strand the incumbent connection: bump the dial generation
+   *  (its callbacks go stale immediately — no state write can land later),
+   *  detach the session object BEFORE any await so a late-resolving close can
+   *  never null a replacement, and discard the resumption handle — a recovery
+   *  redial must never resume the wedged server-side turn. Returns the
+   *  bounded async cleanup: 'closed' when close() completed, 'forced' on
+   *  timeout or close error. */
+  abortIncumbent() {
+    this.dialGen += 1;
+    const incumbent = this.session;
+    this.session = null;
+    this._modelTurnStarted = false;
+    this.config.resumptionHandle = void 0;
+    if (!incumbent) return Promise.resolve("closed");
+    return new Promise((resolve) => {
+      const deadline = setTimeout(() => resolve("forced"), 5e3);
+      void Promise.resolve().then(() => incumbent.close()).then(
+        () => {
+          clearTimeout(deadline);
+          resolve("closed");
+        },
+        () => {
+          clearTimeout(deadline);
+          resolve("forced");
+        }
+      );
+    });
+  }
   async disconnect() {
     this._modelTurnStarted = false;
-    if (this.session) {
+    const incumbent = this.session;
+    if (incumbent) {
       if (this.currentAttemptSetupDone && this.closeEmittedFor !== this.currentAttemptId) {
         this.closeEmittedFor = this.currentAttemptId;
         this.emitLifecycle({
@@ -2851,10 +2904,10 @@ var GeminiLiveTransport = class {
         });
       }
       try {
-        await this.session.close();
+        await incumbent.close();
       } catch {
       }
-      this.session = null;
+      if (this.session === incumbent) this.session = null;
     }
   }
   noteAttempt(slot, rawBytes, wireBytes) {
@@ -3388,6 +3441,22 @@ function isSubstantiveDivergence(liveText, shadowText) {
 }
 
 // src/core/voice-session.ts
+var RECOVERY_CAPABILITIES = Object.freeze({
+  version: 1,
+  recoverUpstream: true,
+  reconnectBoundary: true,
+  turnStartPublication: true,
+  transportGenerations: true,
+  syntheticHold: true
+});
+var DEGRADED_RECOVERY_CAPABILITIES = Object.freeze({
+  version: 1,
+  recoverUpstream: false,
+  reconnectBoundary: true,
+  turnStartPublication: true,
+  transportGenerations: false,
+  syntheticHold: true
+});
 var VoiceSession = class _VoiceSession {
   /** Max wait for a reconnect attempt before giving up and transitioning
    *  to CLOSED. Without this deadline, an ECONNRESET on the in-flight
@@ -3429,9 +3498,19 @@ var VoiceSession = class _VoiceSession {
    *  the CONNECTING state alone doesn't tell handleSetupComplete that
    *  this is a reconnect (vs. an initial connect). */
   _skipNextGreeting = false;
+  _syntheticHoldActive = false;
+  _recoveryInFlight = null;
+  _lastBoundaryGen = null;
   /** Increments per client-connect dial; a close during CONNECTING bumps it
    *  so the abandoned dial's then/catch handlers recognize themselves stale. */
   _dialGen = 0;
+  /** Dial generation each in-flight tool call was issued under, keyed by
+   *  toolCallId. Entries are removed at settlement; the sendToolResult
+   *  fence uses this to drop completions from stranded generations. */
+  _toolCallGens = /* @__PURE__ */ new Map();
+  /** turnId -> dial generation at COMMIT time. A batch provider transcribes
+   *  asynchronously, so completion order says nothing about capture order. */
+  _sttCommitGens = /* @__PURE__ */ new Map();
   /** Whether a browser client is currently connected via WebSocket. */
   get clientConnected() {
     return this._clientConnected;
@@ -3547,7 +3626,13 @@ var VoiceSession = class _VoiceSession {
       );
     }
     this.transport.onAudioOutput = (data) => this.handleAudioOutput(data);
-    this.transport.onToolCall = (calls) => this.toolCallRouter.handleToolCalls(calls);
+    this.transport.onToolCall = (calls) => {
+      const gen = this.transport.currentDialGen;
+      if (gen !== void 0) {
+        for (const c of calls) this._toolCallGens.set(c.id ?? "", gen);
+      }
+      this.toolCallRouter.handleToolCalls(calls);
+    };
     this.transport.onToolCallCancel = (ids) => this.toolCallRouter.handleToolCallCancellation(ids);
     this.transport.onTurnComplete = () => this.handleTurnComplete();
     this.transport.onInterrupted = () => this.handleInterrupted();
@@ -3573,6 +3658,11 @@ var VoiceSession = class _VoiceSession {
       });
       this.sttProvider.onTranscript = (text, turnId) => {
         if (turnId !== void 0 && turnId < this.turnId - 1) return;
+        if (this.sttCaptureIsStale(turnId)) {
+          this.log(`Dropped pre-recovery transcript (turn ${turnId}, captured on a stranded dial)`);
+          return;
+        }
+        this.handleUserSpeechEvidence();
         this.transcriptManager.handleInput(text);
       };
       this.sttProvider.onPartialTranscript = (text) => {
@@ -3581,6 +3671,7 @@ var VoiceSession = class _VoiceSession {
       this.transport.onInputTranscription = void 0;
     } else {
       this.transport.onInputTranscription = (text) => {
+        this.handleUserSpeechEvidence();
         if (this.shadowSttProvider) this._liveInputThisTurn += text;
         this.transcriptManager.handleInput(text);
       };
@@ -3609,16 +3700,17 @@ var VoiceSession = class _VoiceSession {
           if (this.config.divergenceCorrection && turnId !== void 0 && turnId === this.turnId && isSubstantiveDivergence(live, text)) {
             this.log(`[ShadowSTT] speaking self-correction for turn ${turnId}`);
             try {
-              this.clientTransport.sendJsonToClient({ type: "turn.interrupted" });
-              this.transport.sendContent(
+              const sentOk = this.sendSyntheticContent(
                 [
                   {
                     role: "user",
                     text: `[TRANSCRIPTION CORRECTION \u2014 not the user speaking] A second transcription shows the user actually said: "${text}". You answered a mishearing ("${live}"). In ONE short sentence acknowledge the correction (e.g. "sorry \u2014 you asked about \u2026"), then answer the user's ACTUAL question. Do not repeat the wrong answer.`
                   }
                 ],
-                true
+                true,
+                "shadow-stt-correction"
               );
+              if (sentOk) this.clientTransport.sendJsonToClient({ type: "turn.interrupted" });
             } catch {
             }
           }
@@ -3630,8 +3722,17 @@ var VoiceSession = class _VoiceSession {
       );
     }
     this.transport.onModelTurnStart = () => {
+      this.eventBus.publish("turn.start", {
+        sessionId: this.config.sessionId,
+        turnId: `turn_${this.turnId + 1}`,
+        transportGeneration: this.transport.currentTransportGeneration,
+        // Both counters, because they are different domains: a consumer
+        // fencing on recoverUpstream's epoch must compare dial to dial.
+        attemptEpoch: this.transport.currentDialGen
+      });
       if (this.sttProvider && !this._commitFiredForTurn) {
         this._commitFiredForTurn = true;
+        this.stampSttCommit(this.turnId);
         this.sttProvider.commit(this.turnId);
       }
       if (this.shadowSttProvider && this._shadowLastCommittedTurn !== this.turnId) {
@@ -3708,7 +3809,16 @@ var VoiceSession = class _VoiceSession {
       notificationQueue: this.notificationQueue,
       transcriptManager: this.transcriptManager,
       subagentConfigs: this.subagentConfigs,
-      sendToolResult: (result) => this.transport.sendToolResult(result),
+      sendToolResult: (result) => {
+        const issuedGen = this._toolCallGens.get(result.id);
+        this._toolCallGens.delete(result.id);
+        const gen = this.transport.currentDialGen;
+        if (issuedGen !== void 0 && gen !== void 0 && issuedGen !== gen) {
+          this.log(`Dropped stale tool result ${result.id} (issued gen ${issuedGen}, now ${gen})`);
+          return;
+        }
+        this.transport.sendToolResult(result);
+      },
       transfer: (toAgent) => this.transfer(toAgent),
       reportError: (component, error) => this.reportError(component, error),
       log: (msg) => this.log(msg)
@@ -3870,6 +3980,7 @@ var VoiceSession = class _VoiceSession {
   handleTurnComplete() {
     if (this.sttProvider) {
       if (!this._commitFiredForTurn) {
+        this.stampSttCommit(this.turnId);
         this.sttProvider.commit(this.turnId);
       }
       this.sttProvider.handleTurnComplete();
@@ -3919,7 +4030,7 @@ var VoiceSession = class _VoiceSession {
     const text = this.directiveManager.getReinforcementText();
     if (!text) return;
     this.log(`Reinforcing directives: ${text.slice(0, 120)}...`);
-    this.transport.sendContent([{ role: "user", text }], true);
+    this.sendSyntheticContent([{ role: "user", text }], true, "directive-reinforcement");
   }
   /** Send the active agent's greeting prompt to the LLM to trigger a spoken greeting. */
   sendGreeting() {
@@ -3932,17 +4043,19 @@ var VoiceSession = class _VoiceSession {
       const summary = cachedFacts.map((f) => `- ${f.content}`).join("\n");
       const memoryText = `[MEMORY \u2014 what you already know about this user from previous sessions]
 ${summary}`;
-      this.transport.sendContent([{ role: "user", text: memoryText }], true);
-      this.log(`Injected ${cachedFacts.length} memory facts`);
+      if (this.sendSyntheticContent([{ role: "user", text: memoryText }], true, "greeting-memory")) {
+        this.log(`Injected ${cachedFacts.length} memory facts`);
+      }
     }
     const directiveSuffix = this.directiveManager.getSessionSuffix();
     const greetingText = directiveSuffix ? `${directiveSuffix}
 
 ${agent.greeting}` : agent.greeting;
-    this.transport.sendContent([{ role: "user", text: greetingText }], true);
+    this.sendSyntheticContent([{ role: "user", text: greetingText }], true, "greeting");
   }
   handleInterrupted() {
     this.log("Interrupted by user");
+    this.handleUserSpeechEvidence();
     this.sttProvider?.handleInterrupted();
     this.notificationQueue.resetAudio();
     this.notificationQueue.markInterrupted();
@@ -4050,6 +4163,7 @@ ${agent.greeting}` : agent.greeting;
   }
   handleTextInput(text) {
     if (!this.sessionManager.isActive || !text.trim()) return;
+    this.handleUserSpeechEvidence();
     const trimmed = text.trim();
     const activeId = this.interactionMode.getActiveToolCallId();
     if (activeId) {
@@ -4060,6 +4174,135 @@ ${agent.greeting}` : agent.greeting;
     }
     this.transport.sendContent([{ role: "user", text: trimmed }], true);
     this.conversationContext.addUserMessage(trimmed);
+  }
+  /** Compute what THIS session's transport actually supports — never a
+   *  static attestation. Armed-mode consumers must gate on this. */
+  getRecoveryCapabilities() {
+    const t = this.transport;
+    const native = typeof t.abortIncumbent === "function" && typeof t.currentDialGen === "number" && typeof t.currentTransportGeneration === "number";
+    return native ? RECOVERY_CAPABILITIES : DEGRADED_RECOVERY_CAPABILITIES;
+  }
+  isSyntheticHoldActive() {
+    return this._syntheticHoldActive;
+  }
+  /** Fresh user evidence — built-in input transcription, external STT final,
+   *  VAD barge-in, or typed text. Post-boundary by causality: transport paths
+   *  are generation-fenced at ingress, and recoverUpstream resets the
+   *  external STT utterance at the boundary. Releases the hold exactly once. */
+  /** Record the dial generation a turn's STT capture belongs to, and bound the
+   *  map — only the current and immediately preceding turn are ever consulted. */
+  stampSttCommit(turnId) {
+    const gen = this.transport.currentDialGen;
+    if (gen === void 0) return;
+    this._sttCommitGens.set(turnId, gen);
+    for (const t of this._sttCommitGens.keys()) {
+      if (t < turnId - 2) this._sttCommitGens.delete(t);
+    }
+  }
+  /** True when this transcript was captured on a dial that a recovery has since
+   *  stranded. Completing after the boundary does NOT place the speech after it:
+   *  a batch provider's request is issued at commit and resolves whenever the
+   *  API returns, so an utterance from before the boundary can land after it. */
+  sttCaptureIsStale(turnId) {
+    if (turnId === void 0) return false;
+    const capturedGen = this._sttCommitGens.get(turnId);
+    const gen = this.transport.currentDialGen;
+    return capturedGen !== void 0 && gen !== void 0 && capturedGen !== gen;
+  }
+  handleUserSpeechEvidence() {
+    if (!this._syntheticHoldActive) return;
+    this._syntheticHoldActive = false;
+    this.notificationQueue.setHeld(false);
+    this.log("Synthetic hold released by fresh user speech");
+  }
+  /** THE chokepoint for synthetic (non-user-initiated) model input: greeting,
+   *  memory/context injection, directive reinforcement, shadow-STT
+   *  correction. The recovery hold silences all of it until fresh user
+   *  evidence — an automatic path must not trigger autonomous output.
+   *  Returns false when suppressed so callers can skip dependent work. */
+  sendSyntheticContent(turns, turnComplete, origin) {
+    if (this._syntheticHoldActive) {
+      this.log(`Recovery hold suppressed synthetic send (${origin})`);
+      return false;
+    }
+    this.transport.sendContent(turns, turnComplete);
+    return true;
+  }
+  /** Epoch-keyed reconnect boundary: exactly one event per generation, and
+   *  stale generations arriving after a newer boundary are rejected outright.
+   *  Partial transcripts are flushed (committed) rather than merged into the
+   *  next turn; late deltas from the dead generation are rejected by the
+   *  transport's ingress fencing. */
+  /** The published `transportGeneration` field carries the DIAL generation
+   *  (its only caller passes attemptEpoch); the name predates the split. */
+  beginReconnectBoundary(reason, transportGeneration) {
+    if (this._lastBoundaryGen !== null && transportGeneration <= this._lastBoundaryGen) return;
+    this._lastBoundaryGen = transportGeneration;
+    this.transcriptManager.flush();
+    this.eventBus.publish("session.reconnectBoundary", {
+      sessionId: this.config.sessionId,
+      reason,
+      transportGeneration
+    });
+    this.log(`Reconnect boundary (${reason}) at generation ${transportGeneration}`);
+  }
+  /** Atomic upstream recovery (design-voice-active-silence-recovery.md):
+   *  hold -> strand incumbent -> CLOSED -> boundary -> clear resumption
+   *  handle -> injection-free redial. Single-flight; the latch is installed
+   *  BEFORE any synchronous event publication, so a reentrant call from a
+   *  CLOSED/boundary subscriber receives this attempt, never a second one.
+   *  Throws on transports without the recovery primitives — check
+   *  getRecoveryCapabilities().recoverUpstream first. */
+  recoverUpstream(args) {
+    if (this._recoveryInFlight) return this._recoveryInFlight;
+    const transport = this.transport;
+    if (typeof transport.abortIncumbent !== "function" || typeof transport.currentDialGen !== "number") {
+      throw new Error(
+        "recoverUpstream: transport lacks the recovery primitives (getRecoveryCapabilities().recoverUpstream is false)"
+      );
+    }
+    if (args.holdSyntheticUntilFreshSpeech) {
+      this._syntheticHoldActive = true;
+      this.notificationQueue.setHeld(true);
+    }
+    this._skipNextGreeting = true;
+    this._dialGen++;
+    this.sttProvider?.handleInterrupted();
+    const incumbentClosed = transport.abortIncumbent();
+    const attemptEpoch = transport.currentDialGen + 1;
+    this.log(
+      `recoverUpstream(${args.reason}): incumbent stranded, dialing attempt ${attemptEpoch}`
+    );
+    let resolveActivated;
+    let rejectActivated;
+    const activated = new Promise((res, rej) => {
+      resolveActivated = res;
+      rejectActivated = rej;
+    });
+    const result = { attemptEpoch, activated, incumbentClosed };
+    this._recoveryInFlight = result;
+    if (this.sessionManager.state !== "CLOSED") {
+      this.sessionManager.transitionTo("CLOSED");
+    }
+    this.beginReconnectBoundary(args.reason, attemptEpoch);
+    this.sessionManager.clearResumptionHandle();
+    (async () => {
+      this.sessionManager.reset();
+      this.sessionManager.transitionTo("CONNECTING");
+      if (this.config.transport) {
+        await transport.connect();
+      } else {
+        await transport.connect({
+          auth: { type: "api_key", apiKey: this.config.apiKey },
+          model: this.config.geminiModel ?? "gemini-live-2.5-flash-preview"
+        });
+      }
+    })().then(resolveActivated, rejectActivated);
+    void activated.catch(() => {
+    }).finally(() => {
+      this._recoveryInFlight = null;
+    });
+    return result;
   }
   handleClientConnected() {
     this.log(
@@ -4078,7 +4321,7 @@ ${agent.greeting}` : agent.greeting;
         const items = this.conversationContext.items;
         const recent = items.filter((item) => item.role === "user" || item.role === "assistant").slice(-10).map((item) => `${item.role}: ${item.content.slice(0, 150)}`).join("\n");
         if (recent) {
-          this.transport.sendContent(
+          const sentOk = this.sendSyntheticContent(
             [
               {
                 role: "user",
@@ -4086,9 +4329,10 @@ ${agent.greeting}` : agent.greeting;
 ${recent}`
               }
             ],
-            false
+            false,
+            "client-reconnect-context"
           );
-          this.log("Injected conversation context on client reconnect");
+          if (sentOk) this.log("Injected conversation context on client reconnect");
         }
       }
     } else if (this.sessionManager.state === "CLOSED") {
@@ -4110,7 +4354,7 @@ ${recent}`
         const items = this.conversationContext.items;
         const recentMessages = items.filter((item) => item.role === "user" || item.role === "assistant").slice(-10).map((item) => `${item.role}: ${item.content.slice(0, 150)}`).join("\n");
         if (recentMessages) {
-          this.transport.sendContent(
+          const sentOk = this.sendSyntheticContent(
             [
               {
                 role: "user",
@@ -4118,9 +4362,10 @@ ${recent}`
 ${recentMessages}`
               }
             ],
-            false
+            false,
+            "gemini-reconnect-context"
           );
-          this.log("Injected conversation context on Gemini reconnect (silent)");
+          if (sentOk) this.log("Injected conversation context on Gemini reconnect (silent)");
         }
       }).catch((err) => {
         if (dialGen !== this._dialGen || this.sessionManager.state !== "CONNECTING") {
@@ -5215,6 +5460,7 @@ var OpenAIRealtimeTransport = class {
   MemoryDistiller,
   MemoryError,
   OpenAIRealtimeTransport,
+  RECOVERY_CAPABILITIES,
   SessionCompletedError,
   SessionError,
   SessionManager,

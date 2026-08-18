@@ -953,6 +953,13 @@ interface EventPayloadMap {
     'turn.start': {
         sessionId: string;
         turnId: string;
+        transportGeneration?: number;
+        attemptEpoch?: number;
+    };
+    'session.reconnectBoundary': {
+        sessionId: string;
+        reason: string;
+        transportGeneration: number;
     };
     'turn.end': {
         sessionId: string;
@@ -1525,6 +1532,10 @@ declare class BackgroundNotificationQueue {
      * the notification is silently skipped to prevent race conditions where a
      * background task completes synchronously before audio generation begins.
      */
+    /** While held (post-recovery synthetic-input hold), nothing synthetic may
+     *  reach the transport — everything queues until the hold is released. */
+    private held;
+    setHeld(held: boolean): void;
     sendOrQueue(turns: Turn[], turnComplete: boolean, options?: SendOrQueueOptions): void;
     /** Mark that the first audio chunk has been received this turn. */
     markAudioReceived(): void;
@@ -2157,6 +2168,42 @@ interface VoiceSessionConfig {
  * await session.start();
  * ```
  */
+/** Versioned recovery-capability descriptor. Consumers (the engine's
+ *  ACTIVE-silence watchdog) gate ARMED mode on this object, not on method
+ *  sniffing; every field names a behavior contract from the desktop design
+ *  doc design-voice-active-silence-recovery.md. */
+interface RecoveryCapabilities {
+    version: 1;
+    recoverUpstream: boolean;
+    reconnectBoundary: boolean;
+    turnStartPublication: boolean;
+    transportGenerations: boolean;
+    syntheticHold: boolean;
+}
+/** The full descriptor — what a session with the native Gemini transport
+ *  supports. getRecoveryCapabilities() downgrades it for transports that
+ *  lack the recovery primitives; armed mode must read the method, never
+ *  this constant. */
+declare const RECOVERY_CAPABILITIES: RecoveryCapabilities;
+interface RecoverUpstreamArgs {
+    reason: 'active-silence' | 'human-retry' | 'fatal-backoff-clear';
+    skipContextInjection: boolean;
+    holdSyntheticUntilFreshSpeech: boolean;
+}
+interface RecoverUpstreamResult {
+    /** The DIAL generation this recovery dials on — the same domain as the
+     *  tool-call and turn.start `attemptEpoch` fences, and as the lifecycle
+     *  `att_<n>` attempt id. NOT `turn.start.transportGeneration`, which is the
+     *  post-setup counter and is legitimately lower (the dial counter also
+     *  advances on failed and aborted dials). Compare dial to dial: callbacks,
+     *  acks and turn.start events carrying a lower `attemptEpoch` are stale. */
+    attemptEpoch: number;
+    /** Resolves when the replacement transport is ACTIVE; rejects on dial
+     *  failure (the caller's reducer enters waiting-retry on rejection). */
+    activated: Promise<void>;
+    /** Incumbent cleanup: bounded, never rejects. */
+    incumbentClosed: Promise<'closed' | 'forced'>;
+}
 declare class VoiceSession {
     /** Max wait for a reconnect attempt before giving up and transitioning
      *  to CLOSED. Without this deadline, an ECONNRESET on the in-flight
@@ -2198,9 +2245,19 @@ declare class VoiceSession {
      *  the CONNECTING state alone doesn't tell handleSetupComplete that
      *  this is a reconnect (vs. an initial connect). */
     private _skipNextGreeting;
+    private _syntheticHoldActive;
+    private _recoveryInFlight;
+    private _lastBoundaryGen;
     /** Increments per client-connect dial; a close during CONNECTING bumps it
      *  so the abandoned dial's then/catch handlers recognize themselves stale. */
     private _dialGen;
+    /** Dial generation each in-flight tool call was issued under, keyed by
+     *  toolCallId. Entries are removed at settlement; the sendToolResult
+     *  fence uses this to drop completions from stranded generations. */
+    private _toolCallGens;
+    /** turnId -> dial generation at COMMIT time. A batch provider transcribes
+     *  asynchronously, so completion order says nothing about capture order. */
+    private _sttCommitGens;
     /** Whether a browser client is currently connected via WebSocket. */
     get clientConnected(): boolean;
     private notificationQueue;
@@ -2247,6 +2304,45 @@ declare class VoiceSession {
     private handleJsonFromClient;
     private handleFileUpload;
     private handleTextInput;
+    /** Compute what THIS session's transport actually supports — never a
+     *  static attestation. Armed-mode consumers must gate on this. */
+    getRecoveryCapabilities(): RecoveryCapabilities;
+    isSyntheticHoldActive(): boolean;
+    /** Fresh user evidence — built-in input transcription, external STT final,
+     *  VAD barge-in, or typed text. Post-boundary by causality: transport paths
+     *  are generation-fenced at ingress, and recoverUpstream resets the
+     *  external STT utterance at the boundary. Releases the hold exactly once. */
+    /** Record the dial generation a turn's STT capture belongs to, and bound the
+     *  map — only the current and immediately preceding turn are ever consulted. */
+    private stampSttCommit;
+    /** True when this transcript was captured on a dial that a recovery has since
+     *  stranded. Completing after the boundary does NOT place the speech after it:
+     *  a batch provider's request is issued at commit and resolves whenever the
+     *  API returns, so an utterance from before the boundary can land after it. */
+    private sttCaptureIsStale;
+    private handleUserSpeechEvidence;
+    /** THE chokepoint for synthetic (non-user-initiated) model input: greeting,
+     *  memory/context injection, directive reinforcement, shadow-STT
+     *  correction. The recovery hold silences all of it until fresh user
+     *  evidence — an automatic path must not trigger autonomous output.
+     *  Returns false when suppressed so callers can skip dependent work. */
+    private sendSyntheticContent;
+    /** Epoch-keyed reconnect boundary: exactly one event per generation, and
+     *  stale generations arriving after a newer boundary are rejected outright.
+     *  Partial transcripts are flushed (committed) rather than merged into the
+     *  next turn; late deltas from the dead generation are rejected by the
+     *  transport's ingress fencing. */
+    /** The published `transportGeneration` field carries the DIAL generation
+     *  (its only caller passes attemptEpoch); the name predates the split. */
+    private beginReconnectBoundary;
+    /** Atomic upstream recovery (design-voice-active-silence-recovery.md):
+     *  hold -> strand incumbent -> CLOSED -> boundary -> clear resumption
+     *  handle -> injection-free redial. Single-flight; the latch is installed
+     *  BEFORE any synchronous event publication, so a reentrant call from a
+     *  CLOSED/boundary subscriber receives this attempt, never a second one.
+     *  Throws on transports without the recovery primitives — check
+     *  getRecoveryCapabilities().recoverUpstream first. */
+    recoverUpstream(args: RecoverUpstreamArgs): RecoverUpstreamResult;
     private handleClientConnected;
     private handleClientDisconnected;
     private handleTransportError;
@@ -2600,6 +2696,19 @@ declare class GeminiLiveTransport implements LLMTransport {
      *  Accepts either a string handle (legacy API) or ReconnectState (LLMTransport API).
      */
     reconnect(stateOrHandle?: ReconnectState | string): Promise<void>;
+    get currentDialGen(): number;
+    /** The post-setup generation counter — the one lifecycle setup-ok and
+     *  generation-close events carry. Distinct from the dial counter, which
+     *  also advances on failed and aborted dials. */
+    get currentTransportGeneration(): number;
+    /** Synchronously strand the incumbent connection: bump the dial generation
+     *  (its callbacks go stale immediately — no state write can land later),
+     *  detach the session object BEFORE any await so a late-resolving close can
+     *  never null a replacement, and discard the resumption handle — a recovery
+     *  redial must never resume the wedged server-side turn. Returns the
+     *  bounded async cleanup: 'closed' when close() completed, 'forced' on
+     *  timeout or close error. */
+    abortIncumbent(): Promise<'closed' | 'forced'>;
     disconnect(): Promise<void>;
     private noteAttempt;
     private noteSkip;
@@ -2825,4 +2934,4 @@ interface QueuedNotification {
     queuedAt: number;
 }
 
-export { AUDIO_FORMAT, type AgentContext, AgentError, AgentRouter, AudioBuffer, type AudioFormat, type AudioFormatSpec, BackgroundNotificationQueue, type BehaviorCategory, type BehaviorPreset, CLOSE_CODE_CLIENT_BUSY, CLOSE_CODE_SUPERSEDED_BY_TAKEOVER, CLOSE_CODE_VERIFIER_PREEMPTED, CLOSE_REASON_CLIENT_BUSY, CLOSE_REASON_SUPERSEDED_BY_TAKEOVER, CLOSE_REASON_VERIFIER_PREEMPTED, CancelledError, type ClientConnectionRole, type ClientMessage, ClientTransport, type ClientTransportCallbacks, type ClientTransportOptions, type ConnectionLifecycleEvent, type ContentTurn, ConversationContext, type ConversationHistoryStore, ConversationHistoryWriter, type ConversationItem, type ConversationItemRole, DEFAULT_CONNECT_TIMEOUT_MS, DEFAULT_EXTRACTION_TIMEOUT_MS, DEFAULT_RECONNECT_TIMEOUT_MS, DEFAULT_SUBAGENT_TIMEOUT_MS, DEFAULT_TOOL_TIMEOUT_MS, DirectiveManager, type EchoCheckResult, type EchoEnvEntry, EchoGuard, type EchoGuardConfig, type ElevenLabsSTTConfig, ElevenLabsSTTProvider, type ErrorSeverity, EventBus, type EventHandler, type EventPayload, type EventPayloadMap, type EventSourceConfig, type EventType, type ExternalEvent, FrameworkError, type FrameworkHooks, type GeminiBatchSTTConfig, GeminiBatchSTTProvider, GeminiLiveTransport, type GeminiTransportCallbacks, type GeminiTransportConfig, HooksManager, type IEventBus, InMemorySessionStore, InputTimeoutError, InteractionModeManager, type InteractiveSubagentConfig, JsonMemoryStore, type LLMTransport, type LLMTransportConfig, type LLMTransportError, type LiveUsageMetadata, type MainAgent, MemoryCacheManager, type MemoryCategory, MemoryDistiller, type MemoryDistillerConfig, MemoryError, type MemoryFact, type MemoryStore, type NotificationPriority, type OpenAIRealtimeConfig, OpenAIRealtimeTransport, type PaginationOptions, type PendingToolCall, type QueuedNotification, type ReconnectState, type ReplayItem, type ResumptionState, type ResumptionUpdate, type RunSubagentOptions, type STTAudioConfig, type STTProvider, type SendOrQueueOptions, type ServiceSubagentConfig, type SessionAnalytics, type SessionCheckpoint, SessionCompletedError, type SessionConfig, SessionError, type SessionInteractionMode, SessionManager, type SessionRecord, type SessionReport, type SessionState, type SessionStore, type SessionSummary, type SessionUpdate, type SubagentConfig, type SubagentContextSnapshot, type SubagentEventCallbacks, type SubagentMessage, type SubagentResult, type SubagentSession, SubagentSessionImpl, type SubagentSessionState, type SubagentTask, type ToolCall, ToolCallRouter, type ToolCallRouterDeps, type ToolContext, type ToolDefinition, type ToolExecution, ToolExecutionError, ToolExecutor, type ToolResult, TranscriptManager, type TranscriptSink, type TransportAuth, type TransportCapabilities, type TransportDiagnostics, TransportError, type TransportPendingToolCall, type TransportToolCall, type TransportToolResult, type TransportUsageMetadata, type UIPayload, type UIResponse, type Unsubscribe, type UpstreamCounters, type UpstreamSlotCounters, ValidationError, VoiceSession, type VoiceSessionConfig, type VoiceSessionDiagnostics, bestEnvelopeLag, createAgentContext, createAskUserTool, envelopePearson, runSubagent, zodToJsonSchema };
+export { AUDIO_FORMAT, type AgentContext, AgentError, AgentRouter, AudioBuffer, type AudioFormat, type AudioFormatSpec, BackgroundNotificationQueue, type BehaviorCategory, type BehaviorPreset, CLOSE_CODE_CLIENT_BUSY, CLOSE_CODE_SUPERSEDED_BY_TAKEOVER, CLOSE_CODE_VERIFIER_PREEMPTED, CLOSE_REASON_CLIENT_BUSY, CLOSE_REASON_SUPERSEDED_BY_TAKEOVER, CLOSE_REASON_VERIFIER_PREEMPTED, CancelledError, type ClientConnectionRole, type ClientMessage, ClientTransport, type ClientTransportCallbacks, type ClientTransportOptions, type ConnectionLifecycleEvent, type ContentTurn, ConversationContext, type ConversationHistoryStore, ConversationHistoryWriter, type ConversationItem, type ConversationItemRole, DEFAULT_CONNECT_TIMEOUT_MS, DEFAULT_EXTRACTION_TIMEOUT_MS, DEFAULT_RECONNECT_TIMEOUT_MS, DEFAULT_SUBAGENT_TIMEOUT_MS, DEFAULT_TOOL_TIMEOUT_MS, DirectiveManager, type EchoCheckResult, type EchoEnvEntry, EchoGuard, type EchoGuardConfig, type ElevenLabsSTTConfig, ElevenLabsSTTProvider, type ErrorSeverity, EventBus, type EventHandler, type EventPayload, type EventPayloadMap, type EventSourceConfig, type EventType, type ExternalEvent, FrameworkError, type FrameworkHooks, type GeminiBatchSTTConfig, GeminiBatchSTTProvider, GeminiLiveTransport, type GeminiTransportCallbacks, type GeminiTransportConfig, HooksManager, type IEventBus, InMemorySessionStore, InputTimeoutError, InteractionModeManager, type InteractiveSubagentConfig, JsonMemoryStore, type LLMTransport, type LLMTransportConfig, type LLMTransportError, type LiveUsageMetadata, type MainAgent, MemoryCacheManager, type MemoryCategory, MemoryDistiller, type MemoryDistillerConfig, MemoryError, type MemoryFact, type MemoryStore, type NotificationPriority, type OpenAIRealtimeConfig, OpenAIRealtimeTransport, type PaginationOptions, type PendingToolCall, type QueuedNotification, RECOVERY_CAPABILITIES, type ReconnectState, type RecoverUpstreamArgs, type RecoverUpstreamResult, type RecoveryCapabilities, type ReplayItem, type ResumptionState, type ResumptionUpdate, type RunSubagentOptions, type STTAudioConfig, type STTProvider, type SendOrQueueOptions, type ServiceSubagentConfig, type SessionAnalytics, type SessionCheckpoint, SessionCompletedError, type SessionConfig, SessionError, type SessionInteractionMode, SessionManager, type SessionRecord, type SessionReport, type SessionState, type SessionStore, type SessionSummary, type SessionUpdate, type SubagentConfig, type SubagentContextSnapshot, type SubagentEventCallbacks, type SubagentMessage, type SubagentResult, type SubagentSession, SubagentSessionImpl, type SubagentSessionState, type SubagentTask, type ToolCall, ToolCallRouter, type ToolCallRouterDeps, type ToolContext, type ToolDefinition, type ToolExecution, ToolExecutionError, ToolExecutor, type ToolResult, TranscriptManager, type TranscriptSink, type TransportAuth, type TransportCapabilities, type TransportDiagnostics, TransportError, type TransportPendingToolCall, type TransportToolCall, type TransportToolResult, type TransportUsageMetadata, type UIPayload, type UIResponse, type Unsubscribe, type UpstreamCounters, type UpstreamSlotCounters, ValidationError, VoiceSession, type VoiceSessionConfig, type VoiceSessionDiagnostics, bestEnvelopeLag, createAgentContext, createAskUserTool, envelopePearson, runSubagent, zodToJsonSchema };
