@@ -385,6 +385,38 @@ interface UpstreamCounters {
         skippedEmpty: number;
     };
 }
+/** Connection-lifecycle facts, one event per observable transition.
+ *
+ * Variants are split rather than made optional because `transportGeneration`
+ * is minted only on successful setup: a socket that dies BEFORE setupComplete
+ * has no generation, and a single close variant requiring one could not
+ * represent exactly the failures these events exist to preserve. A consumer
+ * correlates by `connectAttemptId`; more than one event can describe one
+ * attempt (e.g. attempt-close followed by setup-failed on timeout). */
+type ConnectionLifecycleEvent = {
+    kind: 'attempt';
+    connectAttemptId: string;
+    handleSupplied: boolean;
+} | {
+    kind: 'setup-ok';
+    connectAttemptId: string;
+    transportGeneration: number;
+} | {
+    kind: 'setup-failed';
+    connectAttemptId: string;
+    reason?: string;
+} | {
+    kind: 'attempt-close';
+    connectAttemptId: string;
+    code?: number;
+    reason?: string;
+} | {
+    kind: 'generation-close';
+    connectAttemptId: string;
+    transportGeneration: number;
+    code?: number;
+    reason?: string;
+};
 /** Point-in-time transport diagnostics; safe to sample on any tick. */
 interface TransportDiagnostics {
     upstream: UpstreamCounters;
@@ -435,6 +467,7 @@ interface LLMTransport {
     onResumptionUpdate?: (handle: string, resumable: boolean) => void;
     onGroundingMetadata?: (metadata: Record<string, unknown>) => void;
     getDiagnostics?(): TransportDiagnostics;
+    onConnectionLifecycle?: (event: ConnectionLifecycleEvent) => void;
 }
 
 /**
@@ -2033,6 +2066,11 @@ interface VoiceSessionConfig {
     /** Called when the shadow STT disagrees with the built-in transcription
      *  (normalized compare; containment = streaming truncation, not a mishear). */
     onTranscriptionDivergence?: (liveText: string, shadowText: string, turnId?: number) => void;
+    /** Connection-lifecycle facts: attempt / setup-ok / setup-failed /
+     *  attempt-close / generation-close, correlated by connectAttemptId.
+     *  `handleSupplied` on the attempt is what lets a consumer track resumed
+     *  lineages without inferring them from log lines. */
+    onConnectionLifecycle?: (event: ConnectionLifecycleEvent) => void;
     /** With shadowSttProvider set: on divergence, SPEAK a self-correction — the
      *  model is told what the user actually said and answers the real question
      *  ("说错自纠", owner-selected option ① 2026-07-30). The shadow result
@@ -2455,6 +2493,8 @@ interface GeminiTransportCallbacks {
     onGoAway?(timeLeft: string): void;
     /** New session resumption handle available. */
     onResumptionUpdate?(handle: string, resumable: boolean): void;
+    /** Connection-lifecycle facts (attempt / setup / close). */
+    onConnectionLifecycle?(event: ConnectionLifecycleEvent): void;
     /** Grounding metadata from Google Search results. */
     onGroundingMetadata?(metadata: Record<string, unknown>): void;
     /** Transport-level error. */
@@ -2474,6 +2514,17 @@ declare class GeminiLiveTransport implements LLMTransport {
     private dialGen;
     private transportGeneration;
     private upstream;
+    private currentAttemptId;
+    private currentAttemptSetupDone;
+    private closeEmittedFor;
+    /** Property form — VoiceSession wires these, not the constructor callbacks. */
+    onConnectionLifecycle?: (event: ConnectionLifecycleEvent) => void;
+    /** Run an observer without letting its failure reach the state machine. A
+     *  throwing attempt observer must not prevent dialing; a throwing setup-ok
+     *  observer must not fake a timeout; a throwing close observer must not
+     *  keep disconnect() from closing the socket. */
+    private notifyLifecycleObserver;
+    private emitLifecycle;
     /** Tracks whether onModelTurnStart has already fired for the current turn. */
     private _modelTurnStarted;
     readonly capabilities: TransportCapabilities;
@@ -2727,4 +2778,4 @@ interface QueuedNotification {
     queuedAt: number;
 }
 
-export { AUDIO_FORMAT, type AgentContext, AgentError, AgentRouter, AudioBuffer, type AudioFormat, type AudioFormatSpec, BackgroundNotificationQueue, type BehaviorCategory, type BehaviorPreset, CLOSE_CODE_CLIENT_BUSY, CLOSE_CODE_SUPERSEDED_BY_TAKEOVER, CLOSE_CODE_VERIFIER_PREEMPTED, CLOSE_REASON_CLIENT_BUSY, CLOSE_REASON_SUPERSEDED_BY_TAKEOVER, CLOSE_REASON_VERIFIER_PREEMPTED, CancelledError, type ClientConnectionRole, type ClientMessage, ClientTransport, type ClientTransportCallbacks, type ClientTransportOptions, type ContentTurn, ConversationContext, type ConversationHistoryStore, ConversationHistoryWriter, type ConversationItem, type ConversationItemRole, DEFAULT_CONNECT_TIMEOUT_MS, DEFAULT_EXTRACTION_TIMEOUT_MS, DEFAULT_RECONNECT_TIMEOUT_MS, DEFAULT_SUBAGENT_TIMEOUT_MS, DEFAULT_TOOL_TIMEOUT_MS, DirectiveManager, type EchoCheckResult, type EchoEnvEntry, EchoGuard, type EchoGuardConfig, type ElevenLabsSTTConfig, ElevenLabsSTTProvider, type ErrorSeverity, EventBus, type EventHandler, type EventPayload, type EventPayloadMap, type EventSourceConfig, type EventType, type ExternalEvent, FrameworkError, type FrameworkHooks, type GeminiBatchSTTConfig, GeminiBatchSTTProvider, GeminiLiveTransport, type GeminiTransportCallbacks, type GeminiTransportConfig, HooksManager, type IEventBus, InMemorySessionStore, InputTimeoutError, InteractionModeManager, type InteractiveSubagentConfig, JsonMemoryStore, type LLMTransport, type LLMTransportConfig, type LLMTransportError, type MainAgent, MemoryCacheManager, type MemoryCategory, MemoryDistiller, type MemoryDistillerConfig, MemoryError, type MemoryFact, type MemoryStore, type NotificationPriority, type OpenAIRealtimeConfig, OpenAIRealtimeTransport, type PaginationOptions, type PendingToolCall, type QueuedNotification, type ReconnectState, type ReplayItem, type ResumptionState, type ResumptionUpdate, type RunSubagentOptions, type STTAudioConfig, type STTProvider, type SendOrQueueOptions, type ServiceSubagentConfig, type SessionAnalytics, type SessionCheckpoint, SessionCompletedError, type SessionConfig, SessionError, type SessionInteractionMode, SessionManager, type SessionRecord, type SessionReport, type SessionState, type SessionStore, type SessionSummary, type SessionUpdate, type SubagentConfig, type SubagentContextSnapshot, type SubagentEventCallbacks, type SubagentMessage, type SubagentResult, type SubagentSession, SubagentSessionImpl, type SubagentSessionState, type SubagentTask, type ToolCall, ToolCallRouter, type ToolCallRouterDeps, type ToolContext, type ToolDefinition, type ToolExecution, ToolExecutionError, ToolExecutor, type ToolResult, TranscriptManager, type TranscriptSink, type TransportAuth, type TransportCapabilities, type TransportDiagnostics, TransportError, type TransportPendingToolCall, type TransportToolCall, type TransportToolResult, type UIPayload, type UIResponse, type Unsubscribe, type UpstreamCounters, type UpstreamSlotCounters, ValidationError, VoiceSession, type VoiceSessionConfig, type VoiceSessionDiagnostics, bestEnvelopeLag, createAgentContext, createAskUserTool, envelopePearson, runSubagent, zodToJsonSchema };
+export { AUDIO_FORMAT, type AgentContext, AgentError, AgentRouter, AudioBuffer, type AudioFormat, type AudioFormatSpec, BackgroundNotificationQueue, type BehaviorCategory, type BehaviorPreset, CLOSE_CODE_CLIENT_BUSY, CLOSE_CODE_SUPERSEDED_BY_TAKEOVER, CLOSE_CODE_VERIFIER_PREEMPTED, CLOSE_REASON_CLIENT_BUSY, CLOSE_REASON_SUPERSEDED_BY_TAKEOVER, CLOSE_REASON_VERIFIER_PREEMPTED, CancelledError, type ClientConnectionRole, type ClientMessage, ClientTransport, type ClientTransportCallbacks, type ClientTransportOptions, type ConnectionLifecycleEvent, type ContentTurn, ConversationContext, type ConversationHistoryStore, ConversationHistoryWriter, type ConversationItem, type ConversationItemRole, DEFAULT_CONNECT_TIMEOUT_MS, DEFAULT_EXTRACTION_TIMEOUT_MS, DEFAULT_RECONNECT_TIMEOUT_MS, DEFAULT_SUBAGENT_TIMEOUT_MS, DEFAULT_TOOL_TIMEOUT_MS, DirectiveManager, type EchoCheckResult, type EchoEnvEntry, EchoGuard, type EchoGuardConfig, type ElevenLabsSTTConfig, ElevenLabsSTTProvider, type ErrorSeverity, EventBus, type EventHandler, type EventPayload, type EventPayloadMap, type EventSourceConfig, type EventType, type ExternalEvent, FrameworkError, type FrameworkHooks, type GeminiBatchSTTConfig, GeminiBatchSTTProvider, GeminiLiveTransport, type GeminiTransportCallbacks, type GeminiTransportConfig, HooksManager, type IEventBus, InMemorySessionStore, InputTimeoutError, InteractionModeManager, type InteractiveSubagentConfig, JsonMemoryStore, type LLMTransport, type LLMTransportConfig, type LLMTransportError, type MainAgent, MemoryCacheManager, type MemoryCategory, MemoryDistiller, type MemoryDistillerConfig, MemoryError, type MemoryFact, type MemoryStore, type NotificationPriority, type OpenAIRealtimeConfig, OpenAIRealtimeTransport, type PaginationOptions, type PendingToolCall, type QueuedNotification, type ReconnectState, type ReplayItem, type ResumptionState, type ResumptionUpdate, type RunSubagentOptions, type STTAudioConfig, type STTProvider, type SendOrQueueOptions, type ServiceSubagentConfig, type SessionAnalytics, type SessionCheckpoint, SessionCompletedError, type SessionConfig, SessionError, type SessionInteractionMode, SessionManager, type SessionRecord, type SessionReport, type SessionState, type SessionStore, type SessionSummary, type SessionUpdate, type SubagentConfig, type SubagentContextSnapshot, type SubagentEventCallbacks, type SubagentMessage, type SubagentResult, type SubagentSession, SubagentSessionImpl, type SubagentSessionState, type SubagentTask, type ToolCall, ToolCallRouter, type ToolCallRouterDeps, type ToolContext, type ToolDefinition, type ToolExecution, ToolExecutionError, ToolExecutor, type ToolResult, TranscriptManager, type TranscriptSink, type TransportAuth, type TransportCapabilities, type TransportDiagnostics, TransportError, type TransportPendingToolCall, type TransportToolCall, type TransportToolResult, type UIPayload, type UIResponse, type Unsubscribe, type UpstreamCounters, type UpstreamSlotCounters, ValidationError, VoiceSession, type VoiceSessionConfig, type VoiceSessionDiagnostics, bestEnvelopeLag, createAgentContext, createAskUserTool, envelopePearson, runSubagent, zodToJsonSchema };
