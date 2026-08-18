@@ -50,4 +50,4 @@ export { TranscriptManager } from './transcript-manager.js';
 export type { TranscriptSink } from './transcript-manager.js';
 
 export { VoiceSession } from './voice-session.js';
-export type { VoiceSessionConfig } from './voice-session.js';
+export type { VoiceSessionConfig, VoiceSessionDiagnostics } from './voice-session.js';

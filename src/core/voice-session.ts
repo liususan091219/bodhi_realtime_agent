@@ -14,7 +14,12 @@ import type { MainAgent, SubagentConfig } from '../types/agent.js';
 import type { BehaviorCategory } from '../types/behavior.js';
 import type { FrameworkHooks } from '../types/hooks.js';
 import type { MemoryStore } from '../types/memory.js';
-import type { LLMTransport, LLMTransportError, STTProvider } from '../types/transport.js';
+import type {
+	LLMTransport,
+	LLMTransportError,
+	STTProvider,
+	UpstreamCounters,
+} from '../types/transport.js';
 import { BackgroundNotificationQueue } from './background-notification-queue.js';
 import { ConversationContext } from './conversation-context.js';
 import { DirectiveManager } from './directive-manager.js';
@@ -30,6 +35,14 @@ import { TranscriptManager } from './transcript-manager.js';
 /**
  * Configuration for creating a VoiceSession.
  */
+/** Shape returned by {@link VoiceSession.getDiagnostics}. */
+export interface VoiceSessionDiagnostics {
+	upstream: UpstreamCounters | null;
+	transportGeneration: number | null;
+	/** EchoGuard.suppressedCount — monotonic per session, 0 when disabled. */
+	echoSuppressed: number;
+}
+
 export interface VoiceSessionConfig {
 	/** Unique session identifier. */
 	sessionId: string;
@@ -584,6 +597,23 @@ export class VoiceSession {
 			reportError: (component, error) => this.reportError(component, error),
 			log: (msg) => this.log(msg),
 		});
+	}
+
+	/**
+	 * Point-in-time send-path diagnostics; safe to sample on any tick.
+	 *
+	 * `upstream`/`transportGeneration` are null on transports that do not report
+	 * diagnostics (injected fakes, other providers) — null means unobserved,
+	 * never zero. `echoSuppressed` is session-owned: the guard is private, and
+	 * suppressed frames never reach the transport counters.
+	 */
+	getDiagnostics(): VoiceSessionDiagnostics {
+		const t = this.transport.getDiagnostics?.();
+		return {
+			upstream: t?.upstream ?? null,
+			transportGeneration: t?.transportGeneration ?? null,
+			echoSuppressed: this.echoGuard?.suppressedCount ?? 0,
+		};
 	}
 
 	/**
