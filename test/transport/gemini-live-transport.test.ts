@@ -387,6 +387,30 @@ describe('GeminiLiveTransport', () => {
 			expect(d.text.queuedRawBytes).toBeGreaterThan(0);
 			expect(d.video.queued).toBe(1);
 			expect(d.video.queuedRawBytes).toBe(90);
+			// Replay goes through sendFile, so the wire uses the supported video
+			// slot — not the deprecated generic `media` field — and the counter
+			// genuinely describes what was sent.
+			const videoSends = mockSession.sendRealtimeInput.mock.calls.filter(
+				(c: unknown[]) => (c[0] as Record<string, unknown>).video,
+			);
+			expect(videoSends).toHaveLength(1);
+			const mediaSends = mockSession.sendRealtimeInput.mock.calls.filter(
+				(c: unknown[]) => (c[0] as Record<string, unknown>).media,
+			);
+			expect(mediaSends).toHaveLength(0);
+		});
+
+		it('an unsupported replay file counts unsupportedMime, not a queued video send', async () => {
+			const transport = new GeminiLiveTransport({ apiKey: 'test-key' }, {});
+			await transport.connect();
+			await transport.reconnect({
+				resumptionHandle: undefined,
+				conversationHistory: [{ type: 'file', base64Data: 'AAAA', mimeType: 'application/pdf' }],
+			});
+
+			const d = transport.getDiagnostics().upstream;
+			expect(d.video.unsupportedMime).toBe(1);
+			expect(d.video.queued).toBe(0);
 		});
 
 		it('getDiagnostics returns a snapshot, not a live reference', async () => {

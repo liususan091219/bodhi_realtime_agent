@@ -704,21 +704,13 @@ export class GeminiLiveTransport implements LLMTransport {
 		// Emit file/inline-data items after the text context. Order within
 		// files is preserved; position relative to surrounding text is not
 		// exact but a bracketed marker above tells the model a file appeared.
+		// Routed through sendFile so the counters describe the wire truthfully
+		// AND the wire uses the supported slots: the generic `media` field maps
+		// to the deprecated media_chunks format Gemini 3.1 rejects with 1007 —
+		// the same migration sendAudio and sendFile already made.
 		for (const item of items) {
 			if (item.type === 'file') {
-				const slot = item.mimeType.startsWith('audio/') ? this.upstream.audio : this.upstream.video;
-				const raw = Buffer.byteLength(item.base64Data, 'base64');
-				this.noteAttempt(slot, raw, item.base64Data.length);
-				const session = this.session;
-				if (!session) {
-					this.noteSkip(slot, () => slot.skippedNoSession++);
-					continue;
-				}
-				this.sendTracked(slot, raw, item.base64Data.length, () =>
-					session.sendRealtimeInput({
-						media: { data: item.base64Data, mimeType: item.mimeType },
-					}),
-				);
+				this.sendFile(item.base64Data, item.mimeType);
 			}
 		}
 	}
