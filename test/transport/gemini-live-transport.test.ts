@@ -277,6 +277,152 @@ describe('GeminiLiveTransport', () => {
 		);
 	});
 
+	describe('upstream diagnostics', () => {
+		const B64 = 'AAAA'.repeat(30); // 120 b64 chars -> 90 raw bytes
+
+		it('counts a queued audio send with split raw/wire byte accounting', async () => {
+			const transport = new GeminiLiveTransport({ apiKey: 'test-key' }, {});
+			await transport.connect();
+			transport.sendAudio(B64);
+
+			const a = transport.getDiagnostics().upstream.audio;
+			expect(a.attempted).toBe(1);
+			expect(a.queued).toBe(1);
+			expect(a.attemptedRawBytes).toBe(90);
+			expect(a.attemptedWireBytesEstimate).toBe(120);
+			expect(a.queuedRawBytes).toBe(90);
+			expect(a.lastQueuedAt).not.toBeNull();
+			expect(a.lastThrewAt).toBeNull();
+		});
+
+		it('a send with no session is attempted+skipped, never queued', () => {
+			const transport = new GeminiLiveTransport({ apiKey: 'test-key' }, {});
+			transport.sendAudio(B64); // never connected
+
+			const a = transport.getDiagnostics().upstream.audio;
+			expect(a.attempted).toBe(1);
+			expect(a.skippedNoSession).toBe(1);
+			expect(a.queued).toBe(0);
+			expect(a.lastSkippedAt).not.toBeNull();
+		});
+
+		it('both text APIs land in the text slot; empty text is skippedEmpty', async () => {
+			const transport = new GeminiLiveTransport({ apiKey: 'test-key' }, {});
+			await transport.connect();
+			transport.sendContent([{ role: 'user', text: 'hello' }]);
+			transport.sendClientContent([{ role: 'user', parts: [{ text: 'world' }] }]);
+			transport.sendContent([{ role: 'user', text: '' }]);
+
+			const t = transport.getDiagnostics().upstream.text;
+			expect(t.attempted).toBe(3);
+			expect(t.queued).toBe(2);
+			expect(t.skippedEmpty).toBe(1);
+			// UTF-8 bytes for text: 'hello' + 'world'
+			expect(t.queuedRawBytes).toBe(10);
+		});
+
+		it('sendFile slots by destination: image->video, audio/*->audio, other->unsupportedMime', async () => {
+			const transport = new GeminiLiveTransport({ apiKey: 'test-key' }, {});
+			await transport.connect();
+			transport.sendFile(B64, 'image/jpeg');
+			transport.sendFile(B64, 'audio/wav');
+			transport.sendFile(B64, 'application/pdf');
+
+			const d = transport.getDiagnostics().upstream;
+			expect(d.video.queued).toBe(1);
+			expect(d.audio.queued).toBe(1);
+			expect(d.video.unsupportedMime).toBe(1);
+			// The unsupported attempt landed on video (2 attempts: jpeg + pdf) and
+			// exactly one guard outcome fired for it.
+			expect(d.video.attempted).toBe(2);
+		});
+
+		it('a throwing send counts threw, rethrows, and never counts queued', async () => {
+			const transport = new GeminiLiveTransport({ apiKey: 'test-key' }, {});
+			await transport.connect();
+			mockSession.sendRealtimeInput.mockImplementationOnce(() => {
+				throw new Error('socket write failed');
+			});
+
+			expect(() => transport.sendAudio(B64)).toThrow('socket write failed');
+			const a = transport.getDiagnostics().upstream.audio;
+			expect(a.attempted).toBe(1);
+			expect(a.threw).toBe(1);
+			expect(a.queued).toBe(0);
+			expect(a.lastThrewAt).not.toBeNull();
+		});
+
+		it('counters reset on a new generation — a new socket starts at zero', async () => {
+			const transport = new GeminiLiveTransport({ apiKey: 'test-key' }, {});
+			await transport.connect();
+			transport.sendAudio(B64);
+			expect(transport.getDiagnostics().transportGeneration).toBe(1);
+			expect(transport.getDiagnostics().upstream.audio.queued).toBe(1);
+
+			// A new connection's setupComplete is the generation boundary.
+			const cbs = capturedConnectConfig.callbacks as Record<string, (msg: unknown) => void>;
+			cbs.onmessage({ setupComplete: { sessionId: 'sid_2' } });
+
+			const d = transport.getDiagnostics();
+			expect(d.transportGeneration).toBe(2);
+			expect(d.upstream.audio.queued).toBe(0);
+			expect(d.upstream.audio.lastQueuedAt).toBeNull();
+		});
+
+		it('reconnect replay traffic hits the counters — injection is not invisible', async () => {
+			const transport = new GeminiLiveTransport({ apiKey: 'test-key' }, {});
+			await transport.connect();
+			await transport.reconnect({
+				resumptionHandle: undefined,
+				conversationHistory: [
+					{ type: 'text', role: 'user', text: 'earlier question' },
+					{ type: 'text', role: 'assistant', text: 'earlier answer' },
+					{ type: 'file', base64Data: 'AAAA'.repeat(30), mimeType: 'image/png' },
+				],
+			});
+
+			// Counters reset at the reconnect's setup, so what remains IS the replay.
+			const d = transport.getDiagnostics().upstream;
+			expect(d.text.queued).toBe(1);
+			expect(d.text.queuedRawBytes).toBeGreaterThan(0);
+			expect(d.video.queued).toBe(1);
+			expect(d.video.queuedRawBytes).toBe(90);
+			// Replay goes through sendFile, so the wire uses the supported video
+			// slot — not the deprecated generic `media` field — and the counter
+			// genuinely describes what was sent.
+			const videoSends = mockSession.sendRealtimeInput.mock.calls.filter(
+				(c: unknown[]) => (c[0] as Record<string, unknown>).video,
+			);
+			expect(videoSends).toHaveLength(1);
+			const mediaSends = mockSession.sendRealtimeInput.mock.calls.filter(
+				(c: unknown[]) => (c[0] as Record<string, unknown>).media,
+			);
+			expect(mediaSends).toHaveLength(0);
+		});
+
+		it('an unsupported replay file counts unsupportedMime, not a queued video send', async () => {
+			const transport = new GeminiLiveTransport({ apiKey: 'test-key' }, {});
+			await transport.connect();
+			await transport.reconnect({
+				resumptionHandle: undefined,
+				conversationHistory: [{ type: 'file', base64Data: 'AAAA', mimeType: 'application/pdf' }],
+			});
+
+			const d = transport.getDiagnostics().upstream;
+			expect(d.video.unsupportedMime).toBe(1);
+			expect(d.video.queued).toBe(0);
+		});
+
+		it('getDiagnostics returns a snapshot, not a live reference', async () => {
+			const transport = new GeminiLiveTransport({ apiKey: 'test-key' }, {});
+			await transport.connect();
+			const snap = transport.getDiagnostics();
+			transport.sendAudio(B64);
+			expect(snap.upstream.audio.attempted).toBe(0);
+			expect(transport.getDiagnostics().upstream.audio.attempted).toBe(1);
+		});
+	});
+
 	describe('sendAudio', () => {
 		it('calls session.sendRealtimeInput with correct format', async () => {
 			const transport = new GeminiLiveTransport({ apiKey: 'test-key' }, {});

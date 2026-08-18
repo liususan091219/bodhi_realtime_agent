@@ -185,6 +185,40 @@ export interface TransportPendingToolCall {
 
 /** Transport-level error with recovery signal. Named LLMTransportError to avoid
  *  collision with the TransportError class in core/errors.ts. */
+/** Per-slot upstream send accounting. Counts and bytes are split
+ *  attempted-vs-queued so dropped work is visible, not averaged away:
+ *  `queued` increments only after the SDK send returned without throwing.
+ *  Wire estimates count payload encoding only (base64/UTF-8), no envelope. */
+export interface UpstreamSlotCounters {
+	attempted: number;
+	queued: number;
+	skippedNoSession: number;
+	threw: number;
+	attemptedRawBytes: number;
+	queuedRawBytes: number;
+	attemptedWireBytesEstimate: number;
+	queuedWireBytesEstimate: number;
+	lastAttemptedAt: number | null;
+	lastQueuedAt: number | null;
+	lastSkippedAt: number | null;
+	lastThrewAt: number | null;
+}
+
+/** Upstream (agent→provider) send counters, one slot per realtime-input kind.
+ *  Reset when a new connection completes setup — a new socket starts at zero. */
+export interface UpstreamCounters {
+	audio: UpstreamSlotCounters;
+	video: UpstreamSlotCounters & { unsupportedMime: number };
+	text: UpstreamSlotCounters & { skippedEmpty: number };
+}
+
+/** Point-in-time transport diagnostics; safe to sample on any tick. */
+export interface TransportDiagnostics {
+	upstream: UpstreamCounters;
+	/** Increments on each connection that completes setup. */
+	transportGeneration: number;
+}
+
 export interface LLMTransportError {
 	error: Error;
 	recoverable: boolean;
@@ -253,4 +287,7 @@ export interface LLMTransport {
 	onGoAway?: (timeLeft: string) => void;
 	onResumptionUpdate?: (handle: string, resumable: boolean) => void;
 	onGroundingMetadata?: (metadata: Record<string, unknown>) => void;
+
+	// --- Optional diagnostics (only on supporting transports) ---
+	getDiagnostics?(): TransportDiagnostics;
 }

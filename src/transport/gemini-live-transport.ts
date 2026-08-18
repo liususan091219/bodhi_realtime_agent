@@ -13,8 +13,11 @@ import type {
 	ReplayItem,
 	SessionUpdate,
 	TransportCapabilities,
+	TransportDiagnostics,
 	TransportToolCall,
 	TransportToolResult,
+	UpstreamCounters,
+	UpstreamSlotCounters,
 } from '../types/transport.js';
 import { zodToJsonSchema } from './zod-to-schema.js';
 
@@ -97,6 +100,31 @@ export interface GeminiTransportCallbacks {
  * callback pattern is preserved for backward compatibility alongside the
  * LLMTransport callback properties.
  */
+function freshSlot(): UpstreamSlotCounters {
+	return {
+		attempted: 0,
+		queued: 0,
+		skippedNoSession: 0,
+		threw: 0,
+		attemptedRawBytes: 0,
+		queuedRawBytes: 0,
+		attemptedWireBytesEstimate: 0,
+		queuedWireBytesEstimate: 0,
+		lastAttemptedAt: null,
+		lastQueuedAt: null,
+		lastSkippedAt: null,
+		lastThrewAt: null,
+	};
+}
+
+function freshUpstreamCounters(): UpstreamCounters {
+	return {
+		audio: freshSlot(),
+		video: { ...freshSlot(), unsupportedMime: 0 },
+		text: { ...freshSlot(), skippedEmpty: 0 },
+	};
+}
+
 export class GeminiLiveTransport implements LLMTransport {
 	private session: Session | null = null;
 	private ai: GoogleGenAI;
@@ -107,6 +135,8 @@ export class GeminiLiveTransport implements LLMTransport {
 	/** Increments per dial; callbacks capture their dial's value so a
 	 *  superseded dial's socket events never reach the live handlers. */
 	private dialGen = 0;
+	private transportGeneration = 0;
+	private upstream: UpstreamCounters = freshUpstreamCounters();
 	/** Tracks whether onModelTurnStart has already fired for the current turn. */
 	private _modelTurnStarted = false;
 
@@ -316,14 +346,56 @@ export class GeminiLiveTransport implements LLMTransport {
 		}
 	}
 
+	private noteAttempt(slot: UpstreamSlotCounters, rawBytes: number, wireBytes: number): void {
+		slot.attempted++;
+		slot.attemptedRawBytes += rawBytes;
+		slot.attemptedWireBytesEstimate += wireBytes;
+		slot.lastAttemptedAt = Date.now();
+	}
+
+	private noteSkip(slot: UpstreamSlotCounters, bump: () => void): void {
+		bump();
+		slot.lastSkippedAt = Date.now();
+	}
+
+	/** Runs the send; `queued` advances only on normal return. Exceptions are
+	 *  counted and RETHROWN — instrumentation must not change error behavior. */
+	private sendTracked(
+		slot: UpstreamSlotCounters,
+		rawBytes: number,
+		wireBytes: number,
+		send: () => void,
+	): void {
+		try {
+			send();
+		} catch (err) {
+			slot.threw++;
+			slot.lastThrewAt = Date.now();
+			throw err;
+		}
+		slot.queued++;
+		slot.queuedRawBytes += rawBytes;
+		slot.queuedWireBytesEstimate += wireBytes;
+		slot.lastQueuedAt = Date.now();
+	}
+
 	/** Send base64-encoded PCM audio to Gemini as realtime input. */
 	sendAudio(base64Data: string): void {
-		if (!this.session) return;
+		const slot = this.upstream.audio;
+		const raw = Buffer.byteLength(base64Data, 'base64');
+		this.noteAttempt(slot, raw, base64Data.length);
+		const session = this.session;
+		if (!session) {
+			this.noteSkip(slot, () => slot.skippedNoSession++);
+			return;
+		}
 		// Use `audio` not `media` — the SDK maps `media` to deprecated `media_chunks`
 		// wire format, which Gemini 3.1 rejects with 1007.
-		this.session.sendRealtimeInput({
-			audio: { data: base64Data, mimeType: 'audio/pcm;rate=16000' },
-		});
+		this.sendTracked(slot, raw, base64Data.length, () =>
+			session.sendRealtimeInput({
+				audio: { data: base64Data, mimeType: 'audio/pcm;rate=16000' },
+			}),
+		);
 	}
 
 	/** Send tool execution results back to Gemini (legacy API). */
@@ -353,7 +425,6 @@ export class GeminiLiveTransport implements LLMTransport {
 		turns: Array<{ role: string; parts: Array<{ text: string }> }>,
 		_turnComplete = true,
 	): void {
-		if (!this.session) return;
 		const text = turns
 			.map((t) => {
 				const body = (t.parts || [])
@@ -365,8 +436,7 @@ export class GeminiLiveTransport implements LLMTransport {
 			})
 			.filter(Boolean)
 			.join('\n');
-		if (!text) return;
-		this.session.sendRealtimeInput({ text });
+		this.sendText(text);
 	}
 
 	/** Update the tool declarations (applied on next reconnect). */
@@ -388,6 +458,14 @@ export class GeminiLiveTransport implements LLMTransport {
 		return this.session !== null;
 	}
 
+	/** Snapshot, not a live reference — safe for a caller to hold across ticks. */
+	getDiagnostics(): TransportDiagnostics {
+		return {
+			upstream: structuredClone(this.upstream),
+			transportGeneration: this.transportGeneration,
+		};
+	}
+
 	// --- LLMTransport methods ---
 
 	/** Send provider-neutral content turns to Gemini.
@@ -398,7 +476,6 @@ export class GeminiLiveTransport implements LLMTransport {
 	 * turns in the injected context.
 	 */
 	sendContent(turns: ContentTurn[], _turnComplete = true): void {
-		if (!this.session) return;
 		const text = turns
 			.map((t) => {
 				const role = t.role === 'assistant' ? 'model' : t.role;
@@ -407,8 +484,25 @@ export class GeminiLiveTransport implements LLMTransport {
 			})
 			.filter(Boolean)
 			.join('\n');
-		if (!text) return;
-		this.session.sendRealtimeInput({ text });
+		this.sendText(text);
+	}
+
+	/** Shared tracked path for both text APIs — they differ only in how the
+	 *  joined text is assembled, so the state machine lives once. */
+	private sendText(text: string): void {
+		const slot = this.upstream.text;
+		const bytes = Buffer.byteLength(text, 'utf8');
+		this.noteAttempt(slot, bytes, bytes);
+		const session = this.session;
+		if (!session) {
+			this.noteSkip(slot, () => slot.skippedNoSession++);
+			return;
+		}
+		if (!text) {
+			this.noteSkip(slot, () => slot.skippedEmpty++);
+			return;
+		}
+		this.sendTracked(slot, bytes, bytes, () => session.sendRealtimeInput({ text }));
 	}
 
 	/** Send a file/image to Gemini as realtime input.
@@ -431,19 +525,29 @@ export class GeminiLiveTransport implements LLMTransport {
 	 *           [System: user attached file] prefix text instead.
 	 */
 	sendFile(base64Data: string, mimeType: string): void {
-		if (!this.session) return;
+		// Slot by destination: image/* fills the video slot; audio/* folds into
+		// the audio counters — same wire slot sendAudio uses.
+		const slot = mimeType.startsWith('audio/') ? this.upstream.audio : this.upstream.video;
+		const raw = Buffer.byteLength(base64Data, 'base64');
+		this.noteAttempt(slot, raw, base64Data.length);
+		const session = this.session;
+		if (!session) {
+			this.noteSkip(slot, () => slot.skippedNoSession++);
+			return;
+		}
 		if (mimeType.startsWith('image/')) {
-			this.session.sendRealtimeInput({
-				video: { data: base64Data, mimeType },
-			});
+			this.sendTracked(slot, raw, base64Data.length, () =>
+				session.sendRealtimeInput({ video: { data: base64Data, mimeType } }),
+			);
 			return;
 		}
 		if (mimeType.startsWith('audio/')) {
-			this.session.sendRealtimeInput({
-				audio: { data: base64Data, mimeType },
-			});
+			this.sendTracked(slot, raw, base64Data.length, () =>
+				session.sendRealtimeInput({ audio: { data: base64Data, mimeType } }),
+			);
 			return;
 		}
+		this.noteSkip(this.upstream.video, () => this.upstream.video.unsupportedMime++);
 		console.warn(
 			`[GeminiLiveTransport] sendFile: unsupported mimeType "${mimeType}" — Gemini Live realtime_input only supports image/* and audio/*. For other file types, summarize via sendContent with a text marker.`,
 		);
@@ -590,18 +694,23 @@ export class GeminiLiveTransport implements LLMTransport {
 			}
 		}
 
+		// Replay is send traffic like any other — it must hit the counters, or
+		// reconnect injection becomes invisible to exactly the accounting that
+		// exists to measure it.
 		if (textChunks.length > 0) {
-			this.session.sendRealtimeInput({ text: textChunks.join('\n') });
+			this.sendText(textChunks.join('\n'));
 		}
 
 		// Emit file/inline-data items after the text context. Order within
 		// files is preserved; position relative to surrounding text is not
 		// exact but a bracketed marker above tells the model a file appeared.
+		// Routed through sendFile so the counters describe the wire truthfully
+		// AND the wire uses the supported slots: the generic `media` field maps
+		// to the deprecated media_chunks format Gemini 3.1 rejects with 1007 —
+		// the same migration sendAudio and sendFile already made.
 		for (const item of items) {
 			if (item.type === 'file') {
-				this.session.sendRealtimeInput({
-					media: { data: item.base64Data, mimeType: item.mimeType },
-				});
+				this.sendFile(item.base64Data, item.mimeType);
 			}
 		}
 	}
@@ -609,6 +718,10 @@ export class GeminiLiveTransport implements LLMTransport {
 	// biome-ignore lint/suspicious/noExplicitAny: LiveServerMessage is a complex union type
 	private handleMessage(msg: any): void {
 		if (msg.setupComplete) {
+			// A connection that completed setup is a new generation; upstream
+			// counters reset with it — a new socket genuinely starts at zero.
+			this.transportGeneration++;
+			this.upstream = freshUpstreamCounters();
 			// Resolve the connect() promise so callers know Gemini is ready
 			if (this.setupResolver) {
 				this.setupResolver();

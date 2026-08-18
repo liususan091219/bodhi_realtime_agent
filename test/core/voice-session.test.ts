@@ -122,6 +122,61 @@ describe('VoiceSession', () => {
 		}
 	});
 
+	// Reachability: diagnostics must be readable from the session a caller
+	// actually holds, fed by real audio through the client-boundary entry point.
+	it('getDiagnostics reflects audio sent through the client path', async () => {
+		session = new VoiceSession({
+			sessionId: 'sess_diag',
+			userId: 'user_1',
+			apiKey: 'test-key',
+			agents: [createEchoAgent()],
+			initialAgent: 'echo',
+			port: 9894,
+			model: mockModel,
+		});
+		await session.start();
+		await new Promise((r) => setTimeout(r, 50));
+
+		const before = session.getDiagnostics();
+		expect(before.transportGeneration).toBe(1);
+		expect(before.echoSuppressed).toBe(0);
+		expect(before.upstream?.audio.attempted).toBe(0);
+
+		// The client transport's onAudioFromClient seam — production audio entry.
+		const pcm = Buffer.alloc(320);
+		(session as unknown as { handleAudioFromClient(d: Buffer): void }).handleAudioFromClient(pcm);
+
+		const after = session.getDiagnostics();
+		expect(after.upstream?.audio.attempted).toBe(1);
+		expect(after.upstream?.audio.queued).toBe(1);
+		expect(after.upstream?.audio.lastQueuedAt).not.toBeNull();
+	});
+
+	it('getDiagnostics reports null upstream for a transport without diagnostics', () => {
+		const bareTransport = {
+			capabilities: { sessionResumption: false },
+			audioFormat: { inputSampleRate: 16000, outputSampleRate: 24000 },
+			updateSession: vi.fn(),
+			disconnect: vi.fn(async () => {}),
+		};
+		session = new VoiceSession({
+			sessionId: 'sess_diag_bare',
+			userId: 'user_1',
+			apiKey: 'test-key',
+			agents: [createEchoAgent()],
+			initialAgent: 'echo',
+			port: 9895,
+			model: mockModel,
+			// biome-ignore lint/suspicious/noExplicitAny: minimal injected transport for the null-diagnostics contract
+			transport: bareTransport as any,
+		});
+
+		const d = session.getDiagnostics();
+		expect(d.upstream).toBeNull();
+		expect(d.transportGeneration).toBeNull();
+		expect(d.echoSuppressed).toBe(0);
+	});
+
 	it('creates with all components', () => {
 		session = new VoiceSession({
 			sessionId: 'sess_1',
