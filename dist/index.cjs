@@ -4154,7 +4154,14 @@ ${agent.greeting}` : agent.greeting;
       this.handleFileUpload(data.base64, data.mimeType, data.fileName);
     } else if (message.type === "text_input" && typeof message.text === "string") {
       this.handleTextInput(message.text);
+    } else {
+      this.config.onClientCommand?.(message);
     }
+  }
+  /** Push one host-owned JSON frame to the attached client (no-op with none
+   *  attached) — the outbound half of the host's client protocol. */
+  sendJsonToClient(message) {
+    this.clientTransport.sendJsonToClient(message);
   }
   handleFileUpload(base64, mimeType, fileName) {
     if (!this.sessionManager.isActive) return;
@@ -4309,11 +4316,16 @@ ${agent.greeting}` : agent.greeting;
       `Client connected (geminiActive=${this.sessionManager.isActive}, state=${this.sessionManager.state})`
     );
     this._clientConnected = true;
+    this.config.onClientConnected?.();
     this.clientTransport.sendJsonToClient({
       type: "session.config",
       audioFormat: this.transport.audioFormat
     });
     this.behaviorManager?.sendCatalog();
+    if (this.config.suppressClientAutoActions?.()) {
+      this.log("Client auto-actions suppressed by host gate");
+      return;
+    }
     if (this.sessionManager.isActive) {
       if (this.turnId === 0) {
         this.sendGreeting();
@@ -4386,6 +4398,7 @@ ${recentMessages}`
   handleClientDisconnected() {
     this.log("Client disconnected");
     this._clientConnected = false;
+    this.config.onClientDisconnected?.();
   }
   // --- Error handling ---
   handleTransportError(error) {

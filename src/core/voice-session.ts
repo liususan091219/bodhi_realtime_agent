@@ -118,6 +118,17 @@ export interface VoiceSessionConfig {
 	 *  `promptTokenCount` is the standing prompt size — the signal for context
 	 *  growth. Fires only on transports that report usage. */
 	onUsageMetadata?: (usage: TransportUsageMetadata) => void;
+	/** Client protocol frames the built-in chain does not handle (e.g. the
+	 *  host's voice.retryUpstream). Built-ins always run first. */
+	onClientCommand?: (message: Record<string, unknown>) => void;
+	/** Real client attach/detach edges — what lets a host resend durable
+	 *  state (e.g. voice-stalled) exactly when a client is there to hear it. */
+	onClientConnected?: () => void;
+	onClientDisconnected?: () => void;
+	/** When true at attach time, the client is configured but greeting,
+	 *  context replay and the CLOSED auto-reconnect are suppressed — the
+	 *  host's recovery-terminal gate (no uncounted dials past its budget). */
+	suppressClientAutoActions?: () => boolean;
 	/** With shadowSttProvider set: on divergence, SPEAK a self-correction — the
 	 *  model is told what the user actually said and answers the real question
 	 *  ("说错自纠", owner-selected option ① 2026-07-30). The shadow result
@@ -1221,7 +1232,16 @@ export class VoiceSession {
 			this.handleFileUpload(data.base64, data.mimeType, data.fileName);
 		} else if (message.type === 'text_input' && typeof message.text === 'string') {
 			this.handleTextInput(message.text);
+		} else {
+			// Not a built-in: the host may own it (voice.retryUpstream, ...).
+			this.config.onClientCommand?.(message);
 		}
+	}
+
+	/** Push one host-owned JSON frame to the attached client (no-op with none
+	 *  attached) — the outbound half of the host's client protocol. */
+	sendJsonToClient(message: Record<string, unknown>): void {
+		this.clientTransport.sendJsonToClient(message);
 	}
 
 	private handleFileUpload(base64: string, mimeType: string, fileName?: string): void {
@@ -1426,6 +1446,10 @@ export class VoiceSession {
 			`Client connected (geminiActive=${this.sessionManager.isActive}, state=${this.sessionManager.state})`,
 		);
 		this._clientConnected = true;
+		// Host attach hook BEFORE the built-in greeting/replay below: a host
+		// resending durable terminal state must win the race with autonomous
+		// output paths (and the recovery hold gates those anyway).
+		this.config.onClientConnected?.();
 
 		// Send audio format config so the client can negotiate correct sample rates
 		this.clientTransport.sendJsonToClient({
@@ -1434,6 +1458,13 @@ export class VoiceSession {
 		});
 
 		this.behaviorManager?.sendCatalog();
+		// Host gate (recovery-terminal state): the client is fully configured
+		// above, but greeting / context replay / the CLOSED auto-reconnect are
+		// suppressed — an uncounted dial would bypass the host's attempt budget.
+		if (this.config.suppressClientAutoActions?.()) {
+			this.log('Client auto-actions suppressed by host gate');
+			return;
+		}
 		if (this.sessionManager.isActive) {
 			if (this.turnId === 0) {
 				this.sendGreeting();
@@ -1534,6 +1565,7 @@ export class VoiceSession {
 	private handleClientDisconnected(): void {
 		this.log('Client disconnected');
 		this._clientConnected = false;
+		this.config.onClientDisconnected?.();
 	}
 
 	// --- Error handling ---
