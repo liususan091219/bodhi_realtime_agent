@@ -2636,10 +2636,13 @@ var GeminiLiveTransport = class {
       };
     }
     if (this.config.compressionConfig) {
-      connectConfig.contextWindowCompression = {
-        triggerTokens: this.config.compressionConfig.triggerTokens,
-        slidingWindow: { targetTokens: this.config.compressionConfig.targetTokens }
+      const { triggerTokens, targetTokens } = this.config.compressionConfig;
+      const compression = {
+        slidingWindow: {}
       };
+      if (triggerTokens !== void 0) compression.triggerTokens = String(triggerTokens);
+      if (targetTokens !== void 0) compression.slidingWindow.targetTokens = String(targetTokens);
+      connectConfig.contextWindowCompression = compression;
     }
     if (this.config.vadConfig) {
       connectConfig.realtimeInputConfig = {

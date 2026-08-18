@@ -2032,9 +2032,11 @@ interface VoiceSessionConfig {
         voiceName?: string;
     };
     /** Context window compression thresholds. */
+    /** Context-window compression. Supply the object with NO thresholds to enable
+     *  it with the server's defaults (trigger 80% of the model limit, target half). */
     compressionConfig?: {
-        triggerTokens: number;
-        targetTokens: number;
+        triggerTokens?: number;
+        targetTokens?: number;
     };
     /** Gemini automatic-VAD tuning — passed through to the Live API as
      *  realtimeInputConfig.automaticActivityDetection. Shorten silenceDurationMs
@@ -2442,9 +2444,11 @@ interface GeminiTransportConfig {
         voiceName?: string;
     };
     /** Context window compression settings (trigger and target token counts). */
+    /** Context-window compression. Supply the object with NO thresholds to enable
+     *  it with the server's defaults (trigger 80% of the model limit, target half). */
     compressionConfig?: {
-        triggerTokens: number;
-        targetTokens: number;
+        triggerTokens?: number;
+        targetTokens?: number;
     };
     /** Enable Gemini's built-in Google Search grounding. */
     googleSearch?: boolean;

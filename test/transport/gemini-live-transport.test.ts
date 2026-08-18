@@ -602,6 +602,54 @@ describe('GeminiLiveTransport', () => {
 		});
 	});
 
+	describe('context window compression', () => {
+		function cwc() {
+			return (capturedConnectConfig.config as Record<string, unknown>).contextWindowCompression as
+				| { triggerTokens?: string; slidingWindow?: { targetTokens?: string } }
+				| undefined;
+		}
+
+		it('is absent entirely when no compressionConfig is supplied', async () => {
+			const transport = new GeminiLiveTransport({ apiKey: 'test-key' }, {});
+			await transport.connect();
+			expect(cwc()).toBeUndefined();
+		});
+
+		it('sends both thresholds as strings — the API types them as int64-over-JSON', async () => {
+			const transport = new GeminiLiveTransport(
+				{ apiKey: 'test-key', compressionConfig: { triggerTokens: 32000, targetTokens: 16000 } },
+				{},
+			);
+			await transport.connect();
+			expect(cwc()).toEqual({ triggerTokens: '32000', slidingWindow: { targetTokens: '16000' } });
+		});
+
+		// An empty object is the documented way to take the server's own tuning
+		// (trigger 80% of the model limit, target half) instead of inventing one.
+		it('enables compression with server defaults when no thresholds are given', async () => {
+			const transport = new GeminiLiveTransport({ apiKey: 'test-key', compressionConfig: {} }, {});
+			await transport.connect();
+			const c = cwc();
+			expect(c).toBeDefined();
+			expect(c).toEqual({ slidingWindow: {} });
+			// Omission must be real absence: an explicit undefined would serialize
+			// as a null threshold and defeat the server default.
+			expect(Object.hasOwn(c as object, 'triggerTokens')).toBe(false);
+			expect(Object.hasOwn((c as { slidingWindow: object }).slidingWindow, 'targetTokens')).toBe(
+				false,
+			);
+		});
+
+		it('omits only the threshold that was not supplied', async () => {
+			const transport = new GeminiLiveTransport(
+				{ apiKey: 'test-key', compressionConfig: { triggerTokens: 20000 } },
+				{},
+			);
+			await transport.connect();
+			expect(cwc()).toEqual({ triggerTokens: '20000', slidingWindow: {} });
+		});
+	});
+
 	describe('sendAudio', () => {
 		it('calls session.sendRealtimeInput with correct format', async () => {
 			const transport = new GeminiLiveTransport({ apiKey: 'test-key' }, {});
