@@ -70,7 +70,9 @@ export interface VoiceSessionConfig {
 	/** Voice configuration for Gemini's speech output. */
 	speechConfig?: { voiceName?: string };
 	/** Context window compression thresholds. */
-	compressionConfig?: { triggerTokens: number; targetTokens: number };
+	/** Context-window compression. Supply the object with NO thresholds to enable
+	 *  it with the server's defaults (trigger 80% of the model limit, target half). */
+	compressionConfig?: { triggerTokens?: number; targetTokens?: number };
 	/** Gemini automatic-VAD tuning — passed through to the Live API as
 	 *  realtimeInputConfig.automaticActivityDetection. Shorten silenceDurationMs
 	 *  to make end-of-turn detection (and thus the bot's reply) faster. */

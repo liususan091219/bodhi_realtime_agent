@@ -37,7 +37,9 @@ export interface GeminiTransportConfig {
 	/** Voice configuration for Gemini's speech synthesis. */
 	speechConfig?: { voiceName?: string };
 	/** Context window compression settings (trigger and target token counts). */
-	compressionConfig?: { triggerTokens: number; targetTokens: number };
+	/** Context-window compression. Supply the object with NO thresholds to enable
+	 *  it with the server's defaults (trigger 80% of the model limit, target half). */
+	compressionConfig?: { triggerTokens?: number; targetTokens?: number };
 	/** Enable Gemini's built-in Google Search grounding. */
 	googleSearch?: boolean;
 	/** Enable server-side transcription of user audio input (default: true). */
@@ -267,10 +269,15 @@ export class GeminiLiveTransport implements LLMTransport {
 		}
 
 		if (this.config.compressionConfig) {
-			connectConfig.contextWindowCompression = {
-				triggerTokens: this.config.compressionConfig.triggerTokens,
-				slidingWindow: { targetTokens: this.config.compressionConfig.targetTokens },
+			// The API types both thresholds as int64-over-JSON, i.e. strings, and
+			// omits => server default. Sending `undefined` would not be omission.
+			const { triggerTokens, targetTokens } = this.config.compressionConfig;
+			const compression: { triggerTokens?: string; slidingWindow: { targetTokens?: string } } = {
+				slidingWindow: {},
 			};
+			if (triggerTokens !== undefined) compression.triggerTokens = String(triggerTokens);
+			if (targetTokens !== undefined) compression.slidingWindow.targetTokens = String(targetTokens);
+			connectConfig.contextWindowCompression = compression;
 		}
 
 		if (this.config.vadConfig) {
