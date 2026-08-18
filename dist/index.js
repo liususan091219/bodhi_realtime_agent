@@ -3002,22 +3002,7 @@ var GeminiLiveTransport = class {
     }
     for (const item of items) {
       if (item.type === "file") {
-        const slot = item.mimeType.startsWith("audio/") ? this.upstream.audio : this.upstream.video;
-        const raw = Buffer.byteLength(item.base64Data, "base64");
-        this.noteAttempt(slot, raw, item.base64Data.length);
-        const session = this.session;
-        if (!session) {
-          this.noteSkip(slot, () => slot.skippedNoSession++);
-          continue;
-        }
-        this.sendTracked(
-          slot,
-          raw,
-          item.base64Data.length,
-          () => session.sendRealtimeInput({
-            media: { data: item.base64Data, mimeType: item.mimeType }
-          })
-        );
+        this.sendFile(item.base64Data, item.mimeType);
       }
     }
   }
