@@ -2616,6 +2616,29 @@ var GeminiLiveTransport = class {
   dialGen = 0;
   transportGeneration = 0;
   upstream = freshUpstreamCounters();
+  currentAttemptId = "";
+  currentAttemptSetupDone = false;
+  closeEmittedFor = "";
+  /** Property form — VoiceSession wires these, not the constructor callbacks. */
+  onConnectionLifecycle;
+  /** Run an observer without letting its failure reach the state machine. A
+   *  throwing attempt observer must not prevent dialing; a throwing setup-ok
+   *  observer must not fake a timeout; a throwing close observer must not
+   *  keep disconnect() from closing the socket. */
+  notifyLifecycleObserver(fn) {
+    try {
+      fn();
+    } catch (err) {
+      console.warn(
+        "[GeminiLiveTransport] onConnectionLifecycle observer threw; lifecycle continues:",
+        err
+      );
+    }
+  }
+  emitLifecycle(event) {
+    this.notifyLifecycleObserver(() => this.callbacks.onConnectionLifecycle?.(event));
+    this.notifyLifecycleObserver(() => this.onConnectionLifecycle?.(event));
+  }
   /** Tracks whether onModelTurnStart has already fired for the current turn. */
   _modelTurnStarted = false;
   // --- LLMTransport static properties ---
@@ -2720,6 +2743,13 @@ var GeminiLiveTransport = class {
       );
     });
     const gen = ++this.dialGen;
+    this.currentAttemptId = `att_${gen}`;
+    this.currentAttemptSetupDone = false;
+    this.emitLifecycle({
+      kind: "attempt",
+      connectAttemptId: this.currentAttemptId,
+      handleSupplied: Boolean(this.config.resumptionHandle)
+    });
     const dial = this.ai.live.connect({
       model,
       config: connectConfig,
@@ -2740,6 +2770,18 @@ var GeminiLiveTransport = class {
           if (gen !== this.dialGen) return;
           const code = e?.code;
           const reason = e?.reason;
+          if (this.closeEmittedFor !== this.currentAttemptId) {
+            this.closeEmittedFor = this.currentAttemptId;
+            this.emitLifecycle(
+              this.currentAttemptSetupDone ? {
+                kind: "generation-close",
+                connectAttemptId: this.currentAttemptId,
+                transportGeneration: this.transportGeneration,
+                code,
+                reason
+              } : { kind: "attempt-close", connectAttemptId: this.currentAttemptId, code, reason }
+            );
+          }
           this.callbacks.onClose?.(code, reason);
           if (this.onClose) this.onClose(code, reason);
         }
@@ -2749,7 +2791,14 @@ var GeminiLiveTransport = class {
       this.session = await Promise.race([dial, timeout]);
       await Promise.race([setupComplete, timeout]);
     } catch (err) {
-      if (gen === this.dialGen) this.dialGen++;
+      if (gen === this.dialGen) {
+        this.emitLifecycle({
+          kind: "setup-failed",
+          connectAttemptId: `att_${gen}`,
+          reason: err instanceof Error ? err.message : String(err)
+        });
+        this.dialGen++;
+      }
       dial.then((s) => s?.close?.()).catch(() => {
       });
       throw err;
@@ -2781,6 +2830,16 @@ var GeminiLiveTransport = class {
   async disconnect() {
     this._modelTurnStarted = false;
     if (this.session) {
+      if (this.currentAttemptSetupDone && this.closeEmittedFor !== this.currentAttemptId) {
+        this.closeEmittedFor = this.currentAttemptId;
+        this.emitLifecycle({
+          kind: "generation-close",
+          connectAttemptId: this.currentAttemptId,
+          transportGeneration: this.transportGeneration,
+          code: 1e3,
+          reason: "local disconnect"
+        });
+      }
       try {
         await this.session.close();
       } catch {
@@ -3099,6 +3158,12 @@ var GeminiLiveTransport = class {
     if (msg.setupComplete) {
       this.transportGeneration++;
       this.upstream = freshUpstreamCounters();
+      this.currentAttemptSetupDone = true;
+      this.emitLifecycle({
+        kind: "setup-ok",
+        connectAttemptId: this.currentAttemptId,
+        transportGeneration: this.transportGeneration
+      });
       if (this.setupResolver) {
         this.setupResolver();
         this.setupResolver = null;
@@ -3468,6 +3533,9 @@ var VoiceSession = class _VoiceSession {
     this.transport.onGoAway = (timeLeft) => this.handleGoAway(timeLeft);
     this.transport.onResumptionUpdate = (handle, resumable) => this.handleResumptionUpdate(handle, resumable);
     this.transport.onGroundingMetadata = (metadata) => this.handleGroundingMetadata(metadata);
+    if (config.onConnectionLifecycle) {
+      this.transport.onConnectionLifecycle = (event) => config.onConnectionLifecycle?.(event);
+    }
     if (config.sttProvider) {
       this.sttProvider = config.sttProvider;
       this.sttProvider.configure({

@@ -5,6 +5,7 @@ import { DEFAULT_CONNECT_TIMEOUT_MS, DEFAULT_RECONNECT_TIMEOUT_MS } from '../cor
 import type { ToolDefinition } from '../types/tool.js';
 import type {
 	AudioFormatSpec,
+	ConnectionLifecycleEvent,
 	ContentTurn,
 	LLMTransport,
 	LLMTransportConfig,
@@ -81,6 +82,8 @@ export interface GeminiTransportCallbacks {
 	onGoAway?(timeLeft: string): void;
 	/** New session resumption handle available. */
 	onResumptionUpdate?(handle: string, resumable: boolean): void;
+	/** Connection-lifecycle facts (attempt / setup / close). */
+	onConnectionLifecycle?(event: ConnectionLifecycleEvent): void;
 	/** Grounding metadata from Google Search results. */
 	onGroundingMetadata?(metadata: Record<string, unknown>): void;
 	/** Transport-level error. */
@@ -137,6 +140,32 @@ export class GeminiLiveTransport implements LLMTransport {
 	private dialGen = 0;
 	private transportGeneration = 0;
 	private upstream: UpstreamCounters = freshUpstreamCounters();
+	private currentAttemptId = '';
+	private currentAttemptSetupDone = false;
+	private closeEmittedFor = '';
+
+	/** Property form — VoiceSession wires these, not the constructor callbacks. */
+	onConnectionLifecycle?: (event: ConnectionLifecycleEvent) => void;
+
+	/** Run an observer without letting its failure reach the state machine. A
+	 *  throwing attempt observer must not prevent dialing; a throwing setup-ok
+	 *  observer must not fake a timeout; a throwing close observer must not
+	 *  keep disconnect() from closing the socket. */
+	private notifyLifecycleObserver(fn: () => void): void {
+		try {
+			fn();
+		} catch (err) {
+			console.warn(
+				'[GeminiLiveTransport] onConnectionLifecycle observer threw; lifecycle continues:',
+				err,
+			);
+		}
+	}
+
+	private emitLifecycle(event: ConnectionLifecycleEvent): void {
+		this.notifyLifecycleObserver(() => this.callbacks.onConnectionLifecycle?.(event));
+		this.notifyLifecycleObserver(() => this.onConnectionLifecycle?.(event));
+	}
 	/** Tracks whether onModelTurnStart has already fired for the current turn. */
 	private _modelTurnStarted = false;
 
@@ -263,6 +292,13 @@ export class GeminiLiveTransport implements LLMTransport {
 		// failure, refused socket) it never settles — the deadline must cover
 		// the dial itself, not just the setupComplete wait.
 		const gen = ++this.dialGen;
+		this.currentAttemptId = `att_${gen}`;
+		this.currentAttemptSetupDone = false;
+		this.emitLifecycle({
+			kind: 'attempt',
+			connectAttemptId: this.currentAttemptId,
+			handleSupplied: Boolean(this.config.resumptionHandle),
+		});
 		const dial = this.ai.live.connect({
 			model,
 			config: connectConfig,
@@ -282,6 +318,22 @@ export class GeminiLiveTransport implements LLMTransport {
 					if (gen !== this.dialGen) return;
 					const code = e?.code;
 					const reason = e?.reason;
+					// A socket that dies before setupComplete has no generation —
+					// that is the setup-failure evidence these events preserve.
+					if (this.closeEmittedFor !== this.currentAttemptId) {
+						this.closeEmittedFor = this.currentAttemptId;
+						this.emitLifecycle(
+							this.currentAttemptSetupDone
+								? {
+										kind: 'generation-close',
+										connectAttemptId: this.currentAttemptId,
+										transportGeneration: this.transportGeneration,
+										code,
+										reason,
+									}
+								: { kind: 'attempt-close', connectAttemptId: this.currentAttemptId, code, reason },
+						);
+					}
 					this.callbacks.onClose?.(code, reason);
 					if (this.onClose) this.onClose(code, reason);
 				},
@@ -292,10 +344,20 @@ export class GeminiLiveTransport implements LLMTransport {
 			this.session = await Promise.race([dial, timeout]);
 			await Promise.race([setupComplete, timeout]);
 		} catch (err) {
+			// Same fencing as every other stale-dial signal: a superseded dial's
+			// late failure is dead — emitting it would follow a newer attempt's
+			// setup-ok with a stale setup-failed.
+			if (gen === this.dialGen) {
+				this.emitLifecycle({
+					kind: 'setup-failed',
+					connectAttemptId: `att_${gen}`,
+					reason: err instanceof Error ? err.message : String(err),
+				});
+				this.dialGen++;
+			}
 			// Abandoned dial: strand its callbacks immediately, and close the
 			// socket if it still opens later — a stale close must never reach
 			// the live handlers as if it were the current connection's.
-			if (gen === this.dialGen) this.dialGen++;
 			dial.then((s) => s?.close?.()).catch(() => {});
 			throw err;
 		} finally {
@@ -337,6 +399,19 @@ export class GeminiLiveTransport implements LLMTransport {
 	async disconnect(): Promise<void> {
 		this._modelTurnStarted = false;
 		if (this.session) {
+			// The websocket's own onclose usually lands after the next dial has
+			// bumped the fence, so a locally initiated close would never emit.
+			// Emit deterministically here; the flag suppresses a late duplicate.
+			if (this.currentAttemptSetupDone && this.closeEmittedFor !== this.currentAttemptId) {
+				this.closeEmittedFor = this.currentAttemptId;
+				this.emitLifecycle({
+					kind: 'generation-close',
+					connectAttemptId: this.currentAttemptId,
+					transportGeneration: this.transportGeneration,
+					code: 1000,
+					reason: 'local disconnect',
+				});
+			}
 			try {
 				await this.session.close();
 			} catch {
@@ -722,6 +797,12 @@ export class GeminiLiveTransport implements LLMTransport {
 			// counters reset with it — a new socket genuinely starts at zero.
 			this.transportGeneration++;
 			this.upstream = freshUpstreamCounters();
+			this.currentAttemptSetupDone = true;
+			this.emitLifecycle({
+				kind: 'setup-ok',
+				connectAttemptId: this.currentAttemptId,
+				transportGeneration: this.transportGeneration,
+			});
 			// Resolve the connect() promise so callers know Gemini is ready
 			if (this.setupResolver) {
 				this.setupResolver();
