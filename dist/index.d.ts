@@ -954,6 +954,7 @@ interface EventPayloadMap {
         sessionId: string;
         turnId: string;
         transportGeneration?: number;
+        attemptEpoch?: number;
     };
     'session.reconnectBoundary': {
         sessionId: string;
@@ -2190,8 +2191,12 @@ interface RecoverUpstreamArgs {
     holdSyntheticUntilFreshSpeech: boolean;
 }
 interface RecoverUpstreamResult {
-    /** Transport generation after the synchronous bump; callbacks, acks and
-     *  turn.start events carrying a lower generation are stale. */
+    /** The DIAL generation this recovery dials on — the same domain as the
+     *  tool-call and turn.start `attemptEpoch` fences, and as the lifecycle
+     *  `att_<n>` attempt id. NOT `turn.start.transportGeneration`, which is the
+     *  post-setup counter and is legitimately lower (the dial counter also
+     *  advances on failed and aborted dials). Compare dial to dial: callbacks,
+     *  acks and turn.start events carrying a lower `attemptEpoch` are stale. */
     attemptEpoch: number;
     /** Resolves when the replacement transport is ACTIVE; rejects on dial
      *  failure (the caller's reducer enters waiting-retry on rejection). */
@@ -2250,6 +2255,9 @@ declare class VoiceSession {
      *  toolCallId. Entries are removed at settlement; the sendToolResult
      *  fence uses this to drop completions from stranded generations. */
     private _toolCallGens;
+    /** turnId -> dial generation at COMMIT time. A batch provider transcribes
+     *  asynchronously, so completion order says nothing about capture order. */
+    private _sttCommitGens;
     /** Whether a browser client is currently connected via WebSocket. */
     get clientConnected(): boolean;
     private notificationQueue;
@@ -2304,6 +2312,14 @@ declare class VoiceSession {
      *  VAD barge-in, or typed text. Post-boundary by causality: transport paths
      *  are generation-fenced at ingress, and recoverUpstream resets the
      *  external STT utterance at the boundary. Releases the hold exactly once. */
+    /** Record the dial generation a turn's STT capture belongs to, and bound the
+     *  map — only the current and immediately preceding turn are ever consulted. */
+    private stampSttCommit;
+    /** True when this transcript was captured on a dial that a recovery has since
+     *  stranded. Completing after the boundary does NOT place the speech after it:
+     *  a batch provider's request is issued at commit and resolves whenever the
+     *  API returns, so an utterance from before the boundary can land after it. */
+    private sttCaptureIsStale;
     private handleUserSpeechEvidence;
     /** THE chokepoint for synthetic (non-user-initiated) model input: greeting,
      *  memory/context injection, directive reinforcement, shadow-STT
@@ -2316,6 +2332,8 @@ declare class VoiceSession {
      *  Partial transcripts are flushed (committed) rather than merged into the
      *  next turn; late deltas from the dead generation are rejected by the
      *  transport's ingress fencing. */
+    /** The published `transportGeneration` field carries the DIAL generation
+     *  (its only caller passes attemptEpoch); the name predates the split. */
     private beginReconnectBoundary;
     /** Atomic upstream recovery (design-voice-active-silence-recovery.md):
      *  hold -> strand incumbent -> CLOSED -> boundary -> clear resumption

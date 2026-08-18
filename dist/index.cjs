@@ -582,16 +582,6 @@ var AgentRouter = class {
     this.extraTools = extraTools;
     this.subagentCallbacks = subagentCallbacks;
   }
-  sessionManager;
-  eventBus;
-  hooks;
-  conversationContext;
-  transport;
-  clientTransport;
-  model;
-  getInstructionSuffix;
-  extraTools;
-  subagentCallbacks;
   agents = /* @__PURE__ */ new Map();
   _activeAgent = null;
   activeSubagents = /* @__PURE__ */ new Map();
@@ -782,9 +772,6 @@ var BackgroundNotificationQueue = class {
     this.log = log;
     this.messageTruncation = messageTruncation;
   }
-  sendContent;
-  log;
-  messageTruncation;
   queue = [];
   audioReceived = false;
   interrupted = false;
@@ -1185,12 +1172,6 @@ var ConversationHistoryWriter = class {
     this.store = store;
     this.subscribe();
   }
-  sessionId;
-  userId;
-  initialAgentName;
-  eventBus;
-  conversationContext;
-  store;
   unsubscribers = [];
   analytics = {
     turnCount: 0,
@@ -1298,8 +1279,6 @@ var SessionManager = class {
     this.userId = config.userId;
     this.initialAgent = config.initialAgent;
   }
-  eventBus;
-  hooks;
   _state = "CREATED";
   _resumptionHandle = null;
   _bufferedMessages = [];
@@ -1417,8 +1396,6 @@ var MemoryCacheManager = class {
     this.store = store;
     this.userId = userId;
   }
-  store;
-  userId;
   cache = [];
   /** Reload cached facts from the store. Best-effort: keeps stale cache on failure. */
   async refresh() {
@@ -1594,7 +1571,6 @@ var TranscriptManager = class {
   constructor(sink) {
     this.sink = sink;
   }
-  sink;
   inputBuffer = "";
   outputBuffer = "";
   /** Pre-tool-call output text, saved when a tool call splits a turn. */
@@ -1889,10 +1865,6 @@ var MemoryDistiller = class {
     this.turnFrequency = config.turnFrequency ?? 5;
     this.extractionTimeoutMs = config.extractionTimeoutMs ?? DEFAULT_EXTRACTION_TIMEOUT_MS;
   }
-  conversationContext;
-  memoryStore;
-  hooks;
-  model;
   turnCount = 0;
   extractionInFlight = false;
   turnFrequency;
@@ -1986,12 +1958,6 @@ var ToolExecutor = class {
     this.sendJsonToClient = sendJsonToClient;
     this.setDirective = setDirective;
   }
-  hooks;
-  eventBus;
-  sessionId;
-  agentName;
-  sendJsonToClient;
-  setDirective;
   tools = /* @__PURE__ */ new Map();
   pending = /* @__PURE__ */ new Map();
   register(tools) {
@@ -2198,11 +2164,6 @@ var ClientTransport = class {
     this.listenTimeoutMs = listenTimeoutMs;
     this.options = options;
   }
-  port;
-  callbacks;
-  host;
-  listenTimeoutMs;
-  options;
   wss = null;
   client = null;
   clientRole = null;
@@ -3547,6 +3508,9 @@ var VoiceSession = class _VoiceSession {
    *  toolCallId. Entries are removed at settlement; the sendToolResult
    *  fence uses this to drop completions from stranded generations. */
   _toolCallGens = /* @__PURE__ */ new Map();
+  /** turnId -> dial generation at COMMIT time. A batch provider transcribes
+   *  asynchronously, so completion order says nothing about capture order. */
+  _sttCommitGens = /* @__PURE__ */ new Map();
   /** Whether a browser client is currently connected via WebSocket. */
   get clientConnected() {
     return this._clientConnected;
@@ -3694,6 +3658,10 @@ var VoiceSession = class _VoiceSession {
       });
       this.sttProvider.onTranscript = (text, turnId) => {
         if (turnId !== void 0 && turnId < this.turnId - 1) return;
+        if (this.sttCaptureIsStale(turnId)) {
+          this.log(`Dropped pre-recovery transcript (turn ${turnId}, captured on a stranded dial)`);
+          return;
+        }
         this.handleUserSpeechEvidence();
         this.transcriptManager.handleInput(text);
       };
@@ -3757,10 +3725,14 @@ var VoiceSession = class _VoiceSession {
       this.eventBus.publish("turn.start", {
         sessionId: this.config.sessionId,
         turnId: `turn_${this.turnId + 1}`,
-        transportGeneration: this.transport.currentTransportGeneration
+        transportGeneration: this.transport.currentTransportGeneration,
+        // Both counters, because they are different domains: a consumer
+        // fencing on recoverUpstream's epoch must compare dial to dial.
+        attemptEpoch: this.transport.currentDialGen
       });
       if (this.sttProvider && !this._commitFiredForTurn) {
         this._commitFiredForTurn = true;
+        this.stampSttCommit(this.turnId);
         this.sttProvider.commit(this.turnId);
       }
       if (this.shadowSttProvider && this._shadowLastCommittedTurn !== this.turnId) {
@@ -4008,6 +3980,7 @@ var VoiceSession = class _VoiceSession {
   handleTurnComplete() {
     if (this.sttProvider) {
       if (!this._commitFiredForTurn) {
+        this.stampSttCommit(this.turnId);
         this.sttProvider.commit(this.turnId);
       }
       this.sttProvider.handleTurnComplete();
@@ -4216,6 +4189,26 @@ ${agent.greeting}` : agent.greeting;
    *  VAD barge-in, or typed text. Post-boundary by causality: transport paths
    *  are generation-fenced at ingress, and recoverUpstream resets the
    *  external STT utterance at the boundary. Releases the hold exactly once. */
+  /** Record the dial generation a turn's STT capture belongs to, and bound the
+   *  map — only the current and immediately preceding turn are ever consulted. */
+  stampSttCommit(turnId) {
+    const gen = this.transport.currentDialGen;
+    if (gen === void 0) return;
+    this._sttCommitGens.set(turnId, gen);
+    for (const t of this._sttCommitGens.keys()) {
+      if (t < turnId - 2) this._sttCommitGens.delete(t);
+    }
+  }
+  /** True when this transcript was captured on a dial that a recovery has since
+   *  stranded. Completing after the boundary does NOT place the speech after it:
+   *  a batch provider's request is issued at commit and resolves whenever the
+   *  API returns, so an utterance from before the boundary can land after it. */
+  sttCaptureIsStale(turnId) {
+    if (turnId === void 0) return false;
+    const capturedGen = this._sttCommitGens.get(turnId);
+    const gen = this.transport.currentDialGen;
+    return capturedGen !== void 0 && gen !== void 0 && capturedGen !== gen;
+  }
   handleUserSpeechEvidence() {
     if (!this._syntheticHoldActive) return;
     this._syntheticHoldActive = false;
@@ -4240,6 +4233,8 @@ ${agent.greeting}` : agent.greeting;
    *  Partial transcripts are flushed (committed) rather than merged into the
    *  next turn; late deltas from the dead generation are rejected by the
    *  transport's ingress fencing. */
+  /** The published `transportGeneration` field carries the DIAL generation
+   *  (its only caller passes attemptEpoch); the name predates the split. */
   beginReconnectBoundary(reason, transportGeneration) {
     if (this._lastBoundaryGen !== null && transportGeneration <= this._lastBoundaryGen) return;
     this._lastBoundaryGen = transportGeneration;
@@ -4446,7 +4441,6 @@ var JsonMemoryStore = class {
   constructor(baseDir) {
     this.baseDir = baseDir;
   }
-  baseDir;
   async addFacts(userId, facts) {
     if (facts.length === 0) return;
     const filePath = this.filePath(userId);
