@@ -37,7 +37,8 @@ export interface EventPayloadMap {
 	'tool.cancel': { sessionId: string; toolCallIds: string[] };
 
 	// Turn events
-	'turn.start': { sessionId: string; turnId: string };
+	'turn.start': { sessionId: string; turnId: string; transportGeneration?: number };
+	'session.reconnectBoundary': { sessionId: string; reason: string; transportGeneration: number };
 	'turn.end': { sessionId: string; turnId: string };
 	'turn.interrupted': { sessionId: string; turnId: string };
 

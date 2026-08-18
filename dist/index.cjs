@@ -581,6 +581,16 @@ var AgentRouter = class {
     this.extraTools = extraTools;
     this.subagentCallbacks = subagentCallbacks;
   }
+  sessionManager;
+  eventBus;
+  hooks;
+  conversationContext;
+  transport;
+  clientTransport;
+  model;
+  getInstructionSuffix;
+  extraTools;
+  subagentCallbacks;
   agents = /* @__PURE__ */ new Map();
   _activeAgent = null;
   activeSubagents = /* @__PURE__ */ new Map();
@@ -771,6 +781,9 @@ var BackgroundNotificationQueue = class {
     this.log = log;
     this.messageTruncation = messageTruncation;
   }
+  sendContent;
+  log;
+  messageTruncation;
   queue = [];
   audioReceived = false;
   interrupted = false;
@@ -788,6 +801,12 @@ var BackgroundNotificationQueue = class {
    * the notification is silently skipped to prevent race conditions where a
    * background task completes synchronously before audio generation begins.
    */
+  /** While held (post-recovery synthetic-input hold), nothing synthetic may
+   *  reach the transport — everything queues until the hold is released. */
+  held = false;
+  setHeld(held) {
+    this.held = held;
+  }
   sendOrQueue(turns, turnComplete, options) {
     const priority = options?.priority ?? "normal";
     const toolCallId = options?.toolCallId;
@@ -797,6 +816,12 @@ var BackgroundNotificationQueue = class {
     }
     if (toolCallId) {
       this.sentNotifications.add(toolCallId);
+    }
+    if (this.held) {
+      this.log("Synthetic hold active \u2014 queuing notification until fresh user speech");
+      if (priority === "high") this.queue.unshift({ turns, turnComplete, priority });
+      else this.queue.push({ turns, turnComplete, priority });
+      return;
     }
     if (priority === "high") {
       if (this.audioReceived && !this.messageTruncation) {
@@ -844,6 +869,7 @@ var BackgroundNotificationQueue = class {
     this.sentNotifications.clear();
   }
   flushOne() {
+    if (this.held) return;
     const notification = this.queue.shift();
     if (notification) {
       this.log(`Flushing queued background notification (${this.queue.length} remaining)`);
@@ -1158,6 +1184,12 @@ var ConversationHistoryWriter = class {
     this.store = store;
     this.subscribe();
   }
+  sessionId;
+  userId;
+  initialAgentName;
+  eventBus;
+  conversationContext;
+  store;
   unsubscribers = [];
   analytics = {
     turnCount: 0,
@@ -1265,6 +1297,8 @@ var SessionManager = class {
     this.userId = config.userId;
     this.initialAgent = config.initialAgent;
   }
+  eventBus;
+  hooks;
   _state = "CREATED";
   _resumptionHandle = null;
   _bufferedMessages = [];
@@ -1382,6 +1416,8 @@ var MemoryCacheManager = class {
     this.store = store;
     this.userId = userId;
   }
+  store;
+  userId;
   cache = [];
   /** Reload cached facts from the store. Best-effort: keeps stale cache on failure. */
   async refresh() {
@@ -1557,6 +1593,7 @@ var TranscriptManager = class {
   constructor(sink) {
     this.sink = sink;
   }
+  sink;
   inputBuffer = "";
   outputBuffer = "";
   /** Pre-tool-call output text, saved when a tool call splits a turn. */
@@ -1851,6 +1888,10 @@ var MemoryDistiller = class {
     this.turnFrequency = config.turnFrequency ?? 5;
     this.extractionTimeoutMs = config.extractionTimeoutMs ?? DEFAULT_EXTRACTION_TIMEOUT_MS;
   }
+  conversationContext;
+  memoryStore;
+  hooks;
+  model;
   turnCount = 0;
   extractionInFlight = false;
   turnFrequency;
@@ -1944,6 +1985,12 @@ var ToolExecutor = class {
     this.sendJsonToClient = sendJsonToClient;
     this.setDirective = setDirective;
   }
+  hooks;
+  eventBus;
+  sessionId;
+  agentName;
+  sendJsonToClient;
+  setDirective;
   tools = /* @__PURE__ */ new Map();
   pending = /* @__PURE__ */ new Map();
   register(tools) {
@@ -2150,6 +2197,11 @@ var ClientTransport = class {
     this.listenTimeoutMs = listenTimeoutMs;
     this.options = options;
   }
+  port;
+  callbacks;
+  host;
+  listenTimeoutMs;
+  options;
   wss = null;
   client = null;
   clientRole = null;
@@ -2837,6 +2889,28 @@ var GeminiLiveTransport = class {
       clearTimeout(timer);
     }
   }
+  get currentDialGen() {
+    return this.dialGen;
+  }
+  /** Synchronously strand the incumbent connection: bump the dial generation
+   *  (its callbacks go stale immediately — no state write can land later) and
+   *  detach the session object BEFORE any await, so a late-resolving close
+   *  can never null a replacement. Returns the bounded async cleanup. */
+  abortIncumbent() {
+    this.dialGen += 1;
+    const incumbent = this.session;
+    this.session = null;
+    this._modelTurnStarted = false;
+    if (!incumbent) return Promise.resolve("closed");
+    return new Promise((resolve) => {
+      const deadline = setTimeout(() => resolve("forced"), 5e3);
+      void Promise.resolve().then(() => incumbent.close()).catch(() => {
+      }).then(() => {
+        clearTimeout(deadline);
+        resolve("closed");
+      });
+    });
+  }
   async disconnect() {
     this._modelTurnStarted = false;
     if (this.session) {
@@ -3388,6 +3462,14 @@ function isSubstantiveDivergence(liveText, shadowText) {
 }
 
 // src/core/voice-session.ts
+var RECOVERY_CAPABILITIES = Object.freeze({
+  version: 1,
+  recoverUpstream: true,
+  reconnectBoundary: true,
+  turnStartPublication: true,
+  transportGenerations: true,
+  syntheticHold: true
+});
 var VoiceSession = class _VoiceSession {
   /** Max wait for a reconnect attempt before giving up and transitioning
    *  to CLOSED. Without this deadline, an ECONNRESET on the in-flight
@@ -3429,6 +3511,9 @@ var VoiceSession = class _VoiceSession {
    *  the CONNECTING state alone doesn't tell handleSetupComplete that
    *  this is a reconnect (vs. an initial connect). */
   _skipNextGreeting = false;
+  _syntheticHoldActive = false;
+  _recoveryInFlight = null;
+  _lastBoundaryGen = null;
   /** Increments per client-connect dial; a close during CONNECTING bumps it
    *  so the abandoned dial's then/catch handlers recognize themselves stale. */
   _dialGen = 0;
@@ -3581,6 +3666,7 @@ var VoiceSession = class _VoiceSession {
       this.transport.onInputTranscription = void 0;
     } else {
       this.transport.onInputTranscription = (text) => {
+        this.handleUserSpeechEvidence();
         if (this.shadowSttProvider) this._liveInputThisTurn += text;
         this.transcriptManager.handleInput(text);
       };
@@ -3630,6 +3716,11 @@ var VoiceSession = class _VoiceSession {
       );
     }
     this.transport.onModelTurnStart = () => {
+      this.eventBus.publish("turn.start", {
+        sessionId: this.config.sessionId,
+        turnId: `turn_${this.turnId + 1}`,
+        transportGeneration: this.transport.currentDialGen ?? 0
+      });
       if (this.sttProvider && !this._commitFiredForTurn) {
         this._commitFiredForTurn = true;
         this.sttProvider.commit(this.turnId);
@@ -4061,6 +4152,75 @@ ${agent.greeting}` : agent.greeting;
     this.transport.sendContent([{ role: "user", text: trimmed }], true);
     this.conversationContext.addUserMessage(trimmed);
   }
+  getRecoveryCapabilities() {
+    return RECOVERY_CAPABILITIES;
+  }
+  isSyntheticHoldActive() {
+    return this._syntheticHoldActive;
+  }
+  /** Fresh user-speech evidence (input transcription or VAD barge-in) —
+   *  post-boundary by causality, since stale-generation input is fenced at
+   *  ingress. Releases the synthetic hold exactly once. */
+  handleUserSpeechEvidence() {
+    if (!this._syntheticHoldActive) return;
+    this._syntheticHoldActive = false;
+    this.notificationQueue.setHeld(false);
+    this.log("Synthetic hold released by fresh user speech");
+  }
+  /** Epoch-keyed reconnect boundary: exactly one event per generation.
+   *  Partial transcripts are flushed (committed) rather than merged into the
+   *  next turn; late deltas from the dead generation are rejected by the
+   *  transport's ingress fencing. */
+  beginReconnectBoundary(reason, transportGeneration) {
+    if (this._lastBoundaryGen === transportGeneration) return;
+    this._lastBoundaryGen = transportGeneration;
+    this.transcriptManager.flush();
+    this.eventBus.publish("session.reconnectBoundary", {
+      sessionId: this.config.sessionId,
+      reason,
+      transportGeneration
+    });
+    this.log(`Reconnect boundary (${reason}) at generation ${transportGeneration}`);
+  }
+  /** Atomic upstream recovery (design-voice-active-silence-recovery.md):
+   *  strand incumbent -> CLOSED -> boundary -> clear resumption handle ->
+   *  optional synthetic hold -> injection-free redial. Single-flight. */
+  recoverUpstream(args) {
+    if (this._recoveryInFlight) return this._recoveryInFlight;
+    const transport = this.transport;
+    const incumbentClosed = transport.abortIncumbent ? transport.abortIncumbent() : Promise.resolve("closed");
+    const attemptEpoch = transport.currentDialGen ?? 0;
+    this.log(`recoverUpstream(${args.reason}): incumbent stranded, generation ${attemptEpoch}`);
+    if (this.sessionManager.state !== "CLOSED") {
+      this.sessionManager.transitionTo("CLOSED");
+    }
+    this.beginReconnectBoundary(args.reason, attemptEpoch);
+    this.sessionManager.clearResumptionHandle();
+    if (args.holdSyntheticUntilFreshSpeech) {
+      this._syntheticHoldActive = true;
+      this.notificationQueue.setHeld(true);
+    }
+    this._skipNextGreeting = true;
+    const activated = (async () => {
+      this.sessionManager.reset();
+      this.sessionManager.transitionTo("CONNECTING");
+      if (this.config.transport) {
+        await transport.connect();
+      } else {
+        await transport.connect({
+          auth: { type: "api_key", apiKey: this.config.apiKey },
+          model: this.config.geminiModel ?? "gemini-live-2.5-flash-preview"
+        });
+      }
+    })();
+    const result = { attemptEpoch, activated, incumbentClosed };
+    this._recoveryInFlight = result;
+    void activated.catch(() => {
+    }).finally(() => {
+      this._recoveryInFlight = null;
+    });
+    return result;
+  }
   handleClientConnected() {
     this.log(
       `Client connected (geminiActive=${this.sessionManager.isActive}, state=${this.sessionManager.state})`
@@ -4196,6 +4356,7 @@ var JsonMemoryStore = class {
   constructor(baseDir) {
     this.baseDir = baseDir;
   }
+  baseDir;
   async addFacts(userId, facts) {
     if (facts.length === 0) return;
     const filePath = this.filePath(userId);

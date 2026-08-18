@@ -953,6 +953,12 @@ interface EventPayloadMap {
     'turn.start': {
         sessionId: string;
         turnId: string;
+        transportGeneration?: number;
+    };
+    'session.reconnectBoundary': {
+        sessionId: string;
+        reason: string;
+        transportGeneration: number;
     };
     'turn.end': {
         sessionId: string;
@@ -1525,6 +1531,10 @@ declare class BackgroundNotificationQueue {
      * the notification is silently skipped to prevent race conditions where a
      * background task completes synchronously before audio generation begins.
      */
+    /** While held (post-recovery synthetic-input hold), nothing synthetic may
+     *  reach the transport — everything queues until the hold is released. */
+    private held;
+    setHeld(held: boolean): void;
     sendOrQueue(turns: Turn[], turnComplete: boolean, options?: SendOrQueueOptions): void;
     /** Mark that the first audio chunk has been received this turn. */
     markAudioReceived(): void;
@@ -2157,6 +2167,33 @@ interface VoiceSessionConfig {
  * await session.start();
  * ```
  */
+/** Versioned recovery-capability descriptor. Consumers (the engine's
+ *  ACTIVE-silence watchdog) gate ARMED mode on this object, not on method
+ *  sniffing; every field names a behavior contract from the desktop design
+ *  doc design-voice-active-silence-recovery.md. */
+declare const RECOVERY_CAPABILITIES: Readonly<{
+    version: 1;
+    recoverUpstream: true;
+    reconnectBoundary: true;
+    turnStartPublication: true;
+    transportGenerations: true;
+    syntheticHold: true;
+}>;
+interface RecoverUpstreamArgs {
+    reason: 'active-silence' | 'human-retry' | 'fatal-backoff-clear';
+    skipContextInjection: boolean;
+    holdSyntheticUntilFreshSpeech: boolean;
+}
+interface RecoverUpstreamResult {
+    /** Transport generation after the synchronous bump; callbacks, acks and
+     *  turn.start events carrying a lower generation are stale. */
+    attemptEpoch: number;
+    /** Resolves when the replacement transport is ACTIVE; rejects on dial
+     *  failure (the caller's reducer enters waiting-retry on rejection). */
+    activated: Promise<void>;
+    /** Incumbent cleanup: bounded, never rejects. */
+    incumbentClosed: Promise<'closed' | 'forced'>;
+}
 declare class VoiceSession {
     /** Max wait for a reconnect attempt before giving up and transitioning
      *  to CLOSED. Without this deadline, an ECONNRESET on the in-flight
@@ -2198,6 +2235,9 @@ declare class VoiceSession {
      *  the CONNECTING state alone doesn't tell handleSetupComplete that
      *  this is a reconnect (vs. an initial connect). */
     private _skipNextGreeting;
+    private _syntheticHoldActive;
+    private _recoveryInFlight;
+    private _lastBoundaryGen;
     /** Increments per client-connect dial; a close during CONNECTING bumps it
      *  so the abandoned dial's then/catch handlers recognize themselves stale. */
     private _dialGen;
@@ -2247,6 +2287,21 @@ declare class VoiceSession {
     private handleJsonFromClient;
     private handleFileUpload;
     private handleTextInput;
+    getRecoveryCapabilities(): typeof RECOVERY_CAPABILITIES;
+    isSyntheticHoldActive(): boolean;
+    /** Fresh user-speech evidence (input transcription or VAD barge-in) —
+     *  post-boundary by causality, since stale-generation input is fenced at
+     *  ingress. Releases the synthetic hold exactly once. */
+    private handleUserSpeechEvidence;
+    /** Epoch-keyed reconnect boundary: exactly one event per generation.
+     *  Partial transcripts are flushed (committed) rather than merged into the
+     *  next turn; late deltas from the dead generation are rejected by the
+     *  transport's ingress fencing. */
+    private beginReconnectBoundary;
+    /** Atomic upstream recovery (design-voice-active-silence-recovery.md):
+     *  strand incumbent -> CLOSED -> boundary -> clear resumption handle ->
+     *  optional synthetic hold -> injection-free redial. Single-flight. */
+    recoverUpstream(args: RecoverUpstreamArgs): RecoverUpstreamResult;
     private handleClientConnected;
     private handleClientDisconnected;
     private handleTransportError;
@@ -2600,6 +2655,12 @@ declare class GeminiLiveTransport implements LLMTransport {
      *  Accepts either a string handle (legacy API) or ReconnectState (LLMTransport API).
      */
     reconnect(stateOrHandle?: ReconnectState | string): Promise<void>;
+    get currentDialGen(): number;
+    /** Synchronously strand the incumbent connection: bump the dial generation
+     *  (its callbacks go stale immediately — no state write can land later) and
+     *  detach the session object BEFORE any await, so a late-resolving close
+     *  can never null a replacement. Returns the bounded async cleanup. */
+    abortIncumbent(): Promise<'closed' | 'forced'>;
     disconnect(): Promise<void>;
     private noteAttempt;
     private noteSkip;

@@ -434,6 +434,32 @@ export class GeminiLiveTransport implements LLMTransport {
 		}
 	}
 
+	get currentDialGen(): number {
+		return this.dialGen;
+	}
+
+	/** Synchronously strand the incumbent connection: bump the dial generation
+	 *  (its callbacks go stale immediately — no state write can land later) and
+	 *  detach the session object BEFORE any await, so a late-resolving close
+	 *  can never null a replacement. Returns the bounded async cleanup. */
+	abortIncumbent(): Promise<'closed' | 'forced'> {
+		this.dialGen += 1;
+		const incumbent = this.session;
+		this.session = null;
+		this._modelTurnStarted = false;
+		if (!incumbent) return Promise.resolve('closed');
+		return new Promise((resolve) => {
+			const deadline = setTimeout(() => resolve('forced'), 5_000);
+			void Promise.resolve()
+				.then(() => incumbent.close())
+				.catch(() => {})
+				.then(() => {
+					clearTimeout(deadline);
+					resolve('closed');
+				});
+		});
+	}
+
 	async disconnect(): Promise<void> {
 		this._modelTurnStarted = false;
 		if (this.session) {
