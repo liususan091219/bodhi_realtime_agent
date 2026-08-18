@@ -2650,6 +2650,9 @@ var GeminiLiveTransport = class {
       if (targetTokens !== void 0) compression.slidingWindow.targetTokens = String(targetTokens);
       connectConfig.contextWindowCompression = compression;
     }
+    if (this.config.mediaResolution) {
+      connectConfig.mediaResolution = this.config.mediaResolution;
+    }
     if (this.config.vadConfig) {
       connectConfig.realtimeInputConfig = {
         automaticActivityDetection: this.config.vadConfig
@@ -3450,6 +3453,7 @@ var VoiceSession = class _VoiceSession {
           googleSearch: initialAgent?.googleSearch,
           speechConfig: config.speechConfig,
           compressionConfig: config.compressionConfig,
+          mediaResolution: config.mediaResolution,
           vadConfig: config.vadConfig,
           inputAudioTranscription: inputTranscription
         },
