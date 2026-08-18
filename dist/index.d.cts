@@ -2105,6 +2105,13 @@ interface VoiceSessionConfig {
      *  `promptTokenCount` is the standing prompt size — the signal for context
      *  growth. Fires only on transports that report usage. */
     onUsageMetadata?: (usage: TransportUsageMetadata) => void;
+    /** Client protocol frames the built-in chain does not handle (e.g. the
+     *  host's voice.retryUpstream). Built-ins always run first. */
+    onClientCommand?: (message: Record<string, unknown>) => void;
+    /** Real client attach/detach edges — what lets a host resend durable
+     *  state (e.g. voice-stalled) exactly when a client is there to hear it. */
+    onClientConnected?: () => void;
+    onClientDisconnected?: () => void;
     /** With shadowSttProvider set: on divergence, SPEAK a self-correction — the
      *  model is told what the user actually said and answers the real question
      *  ("说错自纠", owner-selected option ① 2026-07-30). The shadow result
@@ -2302,6 +2309,9 @@ declare class VoiceSession {
     private handleGoAway;
     private handleResumptionUpdate;
     private handleJsonFromClient;
+    /** Push one host-owned JSON frame to the attached client (no-op with none
+     *  attached) — the outbound half of the host's client protocol. */
+    sendJsonToClient(message: Record<string, unknown>): void;
     private handleFileUpload;
     private handleTextInput;
     /** Compute what THIS session's transport actually supports — never a
