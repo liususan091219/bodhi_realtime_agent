@@ -302,6 +302,9 @@ export class VoiceSession {
 	 *  toolCallId. Entries are removed at settlement; the sendToolResult
 	 *  fence uses this to drop completions from stranded generations. */
 	private _toolCallGens = new Map<string, number>();
+	/** turnId -> dial generation at COMMIT time. A batch provider transcribes
+	 *  asynchronously, so completion order says nothing about capture order. */
+	private _sttCommitGens = new Map<number, number>();
 	/** Whether a browser client is currently connected via WebSocket. */
 	get clientConnected(): boolean {
 		return this._clientConnected;
@@ -506,9 +509,14 @@ export class VoiceSession {
 			// rejecting truly stale transcripts from 2+ turns ago.
 			this.sttProvider.onTranscript = (text, turnId) => {
 				if (turnId !== undefined && turnId < this.turnId - 1) return; // Drop stale results (2+ turns old)
-				// A finalized external transcript is fresh user evidence: the
-				// in-flight utterance was reset at the recovery boundary, so a
-				// final arriving here postdates it.
+				// The turn window above admits the PRECEDING turn, which is exactly
+				// where a pre-recovery capture lands; fence on capture, not arrival.
+				if (this.sttCaptureIsStale(turnId)) {
+					this.log(`Dropped pre-recovery transcript (turn ${turnId}, captured on a stranded dial)`);
+					return;
+				}
+				// A finalized external transcript is fresh user evidence: it was
+				// captured on the current dial, so it postdates the boundary.
 				this.handleUserSpeechEvidence();
 				this.transcriptManager.handleInput(text);
 			};
@@ -622,6 +630,7 @@ export class VoiceSession {
 			});
 			if (this.sttProvider && !this._commitFiredForTurn) {
 				this._commitFiredForTurn = true;
+				this.stampSttCommit(this.turnId);
 				this.sttProvider.commit(this.turnId);
 			}
 			if (this.shadowSttProvider && this._shadowLastCommittedTurn !== this.turnId) {
@@ -949,6 +958,7 @@ export class VoiceSession {
 		// stale-drop (turnId < this.turnId) correctly rejects prior-turn results.
 		if (this.sttProvider) {
 			if (!this._commitFiredForTurn) {
+				this.stampSttCommit(this.turnId);
 				this.sttProvider.commit(this.turnId); // Safety-net commit
 			}
 			this.sttProvider.handleTurnComplete();
@@ -1266,6 +1276,28 @@ export class VoiceSession {
 	 *  VAD barge-in, or typed text. Post-boundary by causality: transport paths
 	 *  are generation-fenced at ingress, and recoverUpstream resets the
 	 *  external STT utterance at the boundary. Releases the hold exactly once. */
+	/** Record the dial generation a turn's STT capture belongs to, and bound the
+	 *  map — only the current and immediately preceding turn are ever consulted. */
+	private stampSttCommit(turnId: number): void {
+		const gen = (this.transport as { currentDialGen?: number }).currentDialGen;
+		if (gen === undefined) return;
+		this._sttCommitGens.set(turnId, gen);
+		for (const t of this._sttCommitGens.keys()) {
+			if (t < turnId - 2) this._sttCommitGens.delete(t);
+		}
+	}
+
+	/** True when this transcript was captured on a dial that a recovery has since
+	 *  stranded. Completing after the boundary does NOT place the speech after it:
+	 *  a batch provider's request is issued at commit and resolves whenever the
+	 *  API returns, so an utterance from before the boundary can land after it. */
+	private sttCaptureIsStale(turnId: number | undefined): boolean {
+		if (turnId === undefined) return false; // streaming VAD auto-commit: no capture stamp to fence on
+		const capturedGen = this._sttCommitGens.get(turnId);
+		const gen = (this.transport as { currentDialGen?: number }).currentDialGen;
+		return capturedGen !== undefined && gen !== undefined && capturedGen !== gen;
+	}
+
 	private handleUserSpeechEvidence(): void {
 		if (!this._syntheticHoldActive) return;
 		this._syntheticHoldActive = false;

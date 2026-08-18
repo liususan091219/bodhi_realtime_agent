@@ -86,6 +86,7 @@ const fakeStt = (): STTProvider =>
 		feedAudio: vi.fn(),
 		commit: vi.fn(),
 		handleInterrupted: vi.fn(),
+		handleTurnComplete: vi.fn(),
 	}) as unknown as STTProvider;
 
 describe('recovery surface', () => {
@@ -377,6 +378,46 @@ describe('recovery surface', () => {
 		await r.activated;
 		expect(session.isSyntheticHoldActive()).toBe(true);
 		(stt as { onTranscript?: (t: string, turnId?: number) => void }).onTranscript?.('hi there');
+		expect(session.isSyntheticHoldActive()).toBe(false);
+	});
+
+	it('a pre-recovery STT capture completing after the boundary does NOT release the hold', async () => {
+		const stt = fakeStt();
+		session = await startSession(9946, {}, { sttProvider: stt });
+		// A turn runs BEFORE recovery: commit() stamps the capture's dial generation.
+		(await fire())({ serverContent: { modelTurn: { parts: [{ inlineData: { data: 'AAAA' } }] } } });
+		const commitCalls = (stt.commit as unknown as { mock: { calls: number[][] } }).mock.calls;
+		expect(commitCalls.length).toBeGreaterThan(0);
+		const preRecoveryTurn = commitCalls[commitCalls.length - 1][0];
+		// Complete the turn so the next one can commit again (the commit latch
+		// clears on turn completion, not on the next model turn).
+		(await fire())({ serverContent: { turnComplete: true } });
+
+		const r = session.recoverUpstream({
+			reason: 'active-silence',
+			skipContextInjection: true,
+			holdSyntheticUntilFreshSpeech: true,
+		});
+		await r.activated;
+		expect(session.isSyntheticHoldActive()).toBe(true);
+
+		// The batch request issued before the boundary now resolves. Arriving after
+		// the boundary does not place the SPEECH after it — the hold must survive.
+		const onTranscript = (stt as { onTranscript?: (t: string, turnId?: number) => void })
+			.onTranscript;
+		onTranscript?.('speech from before the recovery', preRecoveryTurn);
+		expect(session.isSyntheticHoldActive()).toBe(true);
+
+		// Control: a capture stamped on the CURRENT dial still releases it, so the
+		// fence is rejecting stale captures rather than all external finals.
+		(await fire())({ serverContent: { modelTurn: { parts: [{ inlineData: { data: 'AAAA' } }] } } });
+		expect(
+			(stt.commit as unknown as { mock: { calls: number[][] } }).mock.calls.length,
+		).toBeGreaterThan(commitCalls.length - 1);
+		const freshTurn = (stt.commit as unknown as { mock: { calls: number[][] } }).mock.calls.at(
+			-1,
+		)?.[0];
+		onTranscript?.('speech after the recovery', freshTurn);
 		expect(session.isSyntheticHoldActive()).toBe(false);
 	});
 
