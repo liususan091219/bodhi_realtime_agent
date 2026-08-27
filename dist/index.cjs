@@ -1402,7 +1402,7 @@ var ToolCallRouter = class {
   }
   /** Dispatch incoming tool calls to the appropriate handler. */
   handleToolCalls(calls) {
-    const names = calls.map((c) => c.name).join(", ");
+    const names = calls.map((c) => `${c.name}#${c.id}`).join(", ");
     this.deps.log(`Tool calls from LLM: [${names}]`);
     this.deps.transcriptManager.flushInput();
     this.deps.transcriptManager.saveOutputPrefix();
@@ -2505,6 +2505,7 @@ var GeminiLiveTransport = class {
   onError;
   onClose;
   onModelTurnStart;
+  onGenerationComplete;
   onGoAway;
   onResumptionUpdate;
   onGroundingMetadata;
@@ -2910,6 +2911,10 @@ var GeminiLiveTransport = class {
       if (content.interrupted) {
         this.callbacks.onInterrupted?.();
         if (this.onInterrupted) this.onInterrupted();
+      }
+      if (content.generationComplete) {
+        this.callbacks.onGenerationComplete?.();
+        if (this.onGenerationComplete) this.onGenerationComplete();
       }
       if (content.turnComplete) {
         this._modelTurnStarted = false;
@@ -3528,8 +3533,9 @@ var VoiceSession = class _VoiceSession {
       this._commitFiredForTurn = false;
     }
     this.transcriptManager.flush();
+    const endedTurnIdStr = `turn_${this.turnId}`;
     this.turnId++;
-    const turnIdStr = `turn_${this.turnId}`;
+    const turnIdStr = endedTurnIdStr;
     this.log(`Turn complete: ${turnIdStr}`);
     this.eventBus.publish("turn.end", {
       sessionId: this.config.sessionId,
