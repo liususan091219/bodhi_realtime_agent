@@ -122,13 +122,16 @@ describe('turn lifecycle identity (real session)', () => {
 		}
 	});
 
-	it('turn.end names the turn that ENDED, and turn.start actually fires', async () => {
+	it('turn.end names the turn that ENDED — the same id an interrupt for it carries', async () => {
 		// Driven through the real VoiceSession and the mocked provider, not a
-		// re-implementation of the publishing shape. Before this change:
-		//   * turn.end read `turn_${this.turnId}` AFTER the increment, so it named
-		//     the turn about to start — audio filed under one id and the matching
-		//     turn.interrupted under another could never be joined;
-		//   * turn.start was declared in the event map and published by NOTHING.
+		// re-implementation of the publishing shape: an earlier draft asserted
+		// the shape and passed against the bug.
+		//
+		// turn.end read `turn_${this.turnId}` AFTER the increment, so it named
+		// the turn about to START. handleInterrupted publishes the LIVE turnId
+		// and does not increment, so an interrupt and the end of the very same
+		// turn carried different ids and could never be joined — which is how
+		// this surfaced downstream.
 		session = new VoiceSession({
 			sessionId: 'sess_ids',
 			userId: 'u',
@@ -138,9 +141,9 @@ describe('turn lifecycle identity (real session)', () => {
 			port: 9887,
 			model: mockModel,
 		});
-		const starts: string[] = [];
+		const interrupted: string[] = [];
 		const ends: string[] = [];
-		session.eventBus.subscribe('turn.start', (p) => starts.push(p.turnId));
+		session.eventBus.subscribe('turn.interrupted', (p) => interrupted.push(p.turnId));
 		session.eventBus.subscribe('turn.end', (p) => ends.push(p.turnId));
 
 		await session.start();
@@ -149,7 +152,57 @@ describe('turn lifecycle identity (real session)', () => {
 		const { _getMessageHandler } = await import('@google/genai');
 		const fire = (_getMessageHandler as unknown as () => (msg: unknown) => void)();
 
-		// One generation: audio, then the provider closes the turn.
+		// One generation: audio, barged in on, then the provider closes the turn.
+		fire({
+			serverContent: {
+				modelTurn: { parts: [{ inlineData: { data: 'AAAA', mimeType: 'audio/pcm' } }] },
+			},
+		});
+		await new Promise((r) => setTimeout(r, 20));
+		fire({ serverContent: { interrupted: true } });
+		await new Promise((r) => setTimeout(r, 20));
+		fire({ serverContent: { turnComplete: true } });
+		await new Promise((r) => setTimeout(r, 50));
+
+		expect(interrupted).toEqual(['turn_0']);
+		expect(ends).toEqual(['turn_0']); // was 'turn_1'
+	});
+
+	it('a toolCall after turnComplete re-fires onModelTurnStart — known defect, pinned', async () => {
+		// CHARACTERIZATION, not an endorsement. The transport tracks "a model
+		// turn is underway" with a boolean that turnComplete clears, so a tool
+		// call arriving after turnComplete is necessarily relabelled the start
+		// of a new model turn. It may well be the tail of the generation that
+		// just ended — the transport cannot currently tell.
+		//
+		// This is why nothing here publishes 'turn.start' off onModelTurnStart:
+		// a consumer keying per-generation state on it would open a second
+		// candidate for one answer. Fixing the boundary is a separate change;
+		// this test pins the current behaviour so that change has to flip it.
+		session = new VoiceSession({
+			sessionId: 'sess_tool_tail',
+			userId: 'u',
+			apiKey: 'k',
+			agents: [createToolAgent()],
+			initialAgent: 'tool-agent',
+			port: 9889,
+			model: mockModel,
+		});
+		const starts: string[] = [];
+		session.eventBus.subscribe('turn.start', (p) => starts.push(p.turnId));
+
+		await session.start();
+		await new Promise((r) => setTimeout(r, 50));
+
+		let modelTurnStarts = 0;
+		// biome-ignore lint/suspicious/noExplicitAny: reaching the transport for a callback assertion
+		((session as any).transport as { onModelTurnStart?: () => void }).onModelTurnStart = () => {
+			modelTurnStarts++;
+		};
+
+		const { _getMessageHandler } = await import('@google/genai');
+		const fire = (_getMessageHandler as unknown as () => (msg: unknown) => void)();
+
 		fire({
 			serverContent: {
 				modelTurn: { parts: [{ inlineData: { data: 'AAAA', mimeType: 'audio/pcm' } }] },
@@ -157,11 +210,16 @@ describe('turn lifecycle identity (real session)', () => {
 		});
 		await new Promise((r) => setTimeout(r, 20));
 		fire({ serverContent: { turnComplete: true } });
+		await new Promise((r) => setTimeout(r, 20));
+		fire({
+			toolCall: {
+				functionCalls: [{ id: 'fc_1', name: 'get_weather', args: { city: 'Boston' } }],
+			},
+		});
 		await new Promise((r) => setTimeout(r, 50));
 
-		expect(starts.length).toBeGreaterThan(0);
-		expect(ends.length).toBe(1);
-		expect(ends[0]).toBe(starts[0]);
+		expect(modelTurnStarts).toBe(2); // the defect: one generation, two "starts"
+		expect(starts).toEqual([]); // and this PR publishes no turn.start off it
 	});
 
 	it('generationComplete reaches the transport callback', async () => {

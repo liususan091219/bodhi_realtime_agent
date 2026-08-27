@@ -70,7 +70,7 @@ export interface GeminiTransportCallbacks {
 	onInterrupted?(): void;
 	/** Model started a new response turn (first audio or tool call). */
 	onModelTurnStart?(): void;
-	/** The model finished generating. Distinct from, and earlier than, turnComplete. */
+	/** The model finished generating. Distinct from turnComplete. */
 	onGenerationComplete?(): void;
 	/** Transcription of user's spoken input. */
 	onInputTranscription?(text: string): void;
