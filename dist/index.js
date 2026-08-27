@@ -1333,7 +1333,7 @@ var ToolCallRouter = class {
   }
   /** Dispatch incoming tool calls to the appropriate handler. */
   handleToolCalls(calls) {
-    const names = calls.map((c) => c.name).join(", ");
+    const names = calls.map((c) => `${c.name}#${c.id}`).join(", ");
     this.deps.log(`Tool calls from LLM: [${names}]`);
     this.deps.transcriptManager.flushInput();
     this.deps.transcriptManager.saveOutputPrefix();
@@ -2597,6 +2597,7 @@ var GeminiLiveTransport = class {
   onError;
   onClose;
   onModelTurnStart;
+  onGenerationComplete;
   onGoAway;
   /** Property form — VoiceSession wires these, not the constructor callbacks.
    *  Typed to the neutral shape so it satisfies LLMTransport; the object passed
@@ -3194,6 +3195,10 @@ var GeminiLiveTransport = class {
       if (content.interrupted) {
         this.callbacks.onInterrupted?.();
         if (this.onInterrupted) this.onInterrupted();
+      }
+      if (content.generationComplete) {
+        this.callbacks.onGenerationComplete?.();
+        if (this.onGenerationComplete) this.onGenerationComplete();
       }
       if (content.turnComplete) {
         this._modelTurnStarted = false;
@@ -3976,7 +3981,11 @@ ${agent.greeting}` : agent.greeting;
     this.turnFirstAudioAt = null;
     this.eventBus.publish("turn.interrupted", {
       sessionId: this.config.sessionId,
-      turnId: `turn_${this.turnId}`
+      // Same 1-based id turn.start and turn.end use. handleTurnComplete
+      // increments before publishing and turn.start adds one, so the live
+      // counter is one BEHIND the turn everything else is naming — an
+      // interrupt and the end of the same turn reported different ids.
+      turnId: `turn_${this.turnId + 1}`
     });
     this.clientTransport.sendJsonToClient({ type: "turn.interrupted" });
   }

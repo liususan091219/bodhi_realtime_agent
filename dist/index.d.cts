@@ -2632,6 +2632,8 @@ interface GeminiTransportCallbacks {
     onInterrupted?(): void;
     /** Model started a new response turn (first audio or tool call). */
     onModelTurnStart?(): void;
+    /** The model finished generating. Distinct from turnComplete. */
+    onGenerationComplete?(): void;
     /** Transcription of user's spoken input. */
     onInputTranscription?(text: string): void;
     /** Transcription of model's spoken output. */
@@ -2690,6 +2692,7 @@ declare class GeminiLiveTransport implements LLMTransport {
     onError?: (error: LLMTransportError) => void;
     onClose?: (code?: number, reason?: string) => void;
     onModelTurnStart?: () => void;
+    onGenerationComplete?: () => void;
     onGoAway?: (timeLeft: string) => void;
     /** Property form — VoiceSession wires these, not the constructor callbacks.
      *  Typed to the neutral shape so it satisfies LLMTransport; the object passed

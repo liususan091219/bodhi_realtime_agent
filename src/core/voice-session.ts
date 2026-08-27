@@ -1088,7 +1088,11 @@ export class VoiceSession {
 		this.turnFirstAudioAt = null;
 		this.eventBus.publish('turn.interrupted', {
 			sessionId: this.config.sessionId,
-			turnId: `turn_${this.turnId}`,
+			// Same 1-based id turn.start and turn.end use. handleTurnComplete
+			// increments before publishing and turn.start adds one, so the live
+			// counter is one BEHIND the turn everything else is naming — an
+			// interrupt and the end of the same turn reported different ids.
+			turnId: `turn_${this.turnId + 1}`,
 		});
 		this.clientTransport.sendJsonToClient({ type: 'turn.interrupted' });
 	}
