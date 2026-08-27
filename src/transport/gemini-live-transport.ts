@@ -6,6 +6,7 @@ import type { ToolDefinition } from '../types/tool.js';
 import type {
 	AudioFormatSpec,
 	ContentTurn,
+	GenerationEndReason,
 	LLMTransport,
 	LLMTransportConfig,
 	LLMTransportError,
@@ -69,7 +70,11 @@ export interface GeminiTransportCallbacks {
 	/** Model's response was interrupted by user speech. */
 	onInterrupted?(): void;
 	/** Model started a new response turn (first audio or tool call). */
-	onModelTurnStart?(): void;
+	onModelTurnStart?(generationId?: string): void;
+	/** A generation opened. Paired with onGenerationEnd; see events.ts. */
+	onGenerationStart?(generationId: string): void;
+	/** That generation closed, and why. Fires exactly once per start. */
+	onGenerationEnd?(generationId: string, reason: GenerationEndReason): void;
 	/** The model finished generating. Distinct from turnComplete. */
 	onGenerationComplete?(): void;
 	/** Transcription of user's spoken input. */
@@ -123,6 +128,13 @@ export class GeminiLiveTransport implements LLMTransport {
 	 * Only provider events move this — nothing here times or gaps a boundary.
 	 */
 	private _genState: 'idle' | 'active' | 'draining' | 'terminal' = 'idle';
+	/**
+	 * Identity of the generation the state above refers to. Its own counter,
+	 * NOT the session's turnId: turnId increments at turnComplete, so a
+	 * generation still draining would report its end under the next turn's id.
+	 */
+	private _genSeq = 0;
+	private _genId = 'gen_0';
 
 	// --- LLMTransport static properties ---
 
@@ -156,7 +168,9 @@ export class GeminiLiveTransport implements LLMTransport {
 	onSessionReady?: (sessionId: string) => void;
 	onError?: (error: LLMTransportError) => void;
 	onClose?: (code?: number, reason?: string) => void;
-	onModelTurnStart?: () => void;
+	onModelTurnStart?: (generationId?: string) => void;
+	onGenerationStart?: (generationId: string) => void;
+	onGenerationEnd?: (generationId: string, reason: GenerationEndReason) => void;
 	onGenerationComplete?: () => void;
 	onGoAway?: (timeLeft: string) => void;
 	onResumptionUpdate?: (handle: string, resumable: boolean) => void;
@@ -310,12 +324,33 @@ export class GeminiLiveTransport implements LLMTransport {
 	private beginGenerationIfNew(audioOpensNew: boolean): void {
 		if (this._genState === 'active') return;
 		if (this._genState === 'draining' && !audioOpensNew) return;
+		// Draining and the model speaks again: that generation is over and
+		// never said so. Close it before opening the next, or a consumer is
+		// left holding two open candidates.
+		if (this._genState === 'draining') this.endGeneration('superseded');
 		this._genState = 'active';
-		this.callbacks.onModelTurnStart?.();
-		if (this.onModelTurnStart) this.onModelTurnStart();
+		this._genId = `gen_${this._genSeq}`;
+		this.callbacks.onModelTurnStart?.(this._genId);
+		if (this.onModelTurnStart) this.onModelTurnStart(this._genId);
+		this.callbacks.onGenerationStart?.(this._genId);
+		if (this.onGenerationStart) this.onGenerationStart(this._genId);
+	}
+
+	/**
+	 * Close the current generation. The single exit, so every terminal reason
+	 * fires exactly one generation.end and cannot fire a second.
+	 */
+	private endGeneration(reason: GenerationEndReason): void {
+		if (this._genState !== 'active' && this._genState !== 'draining') return;
+		this._genState = 'terminal';
+		const id = this._genId;
+		this._genSeq++;
+		this.callbacks.onGenerationEnd?.(id, reason);
+		if (this.onGenerationEnd) this.onGenerationEnd(id, reason);
 	}
 
 	async disconnect(): Promise<void> {
+		this.endGeneration('disconnected');
 		this._genState = 'idle';
 		if (this.session) {
 			try {
@@ -666,7 +701,7 @@ export class GeminiLiveTransport implements LLMTransport {
 			// Turn signals
 			if (content.interrupted) {
 				// Barged in on: this generation is over, nothing more belongs to it.
-				if (this._genState !== 'idle') this._genState = 'terminal';
+				this.endGeneration('interrupted');
 				this.callbacks.onInterrupted?.();
 				if (this.onInterrupted) this.onInterrupted();
 			}
@@ -675,7 +710,7 @@ export class GeminiLiveTransport implements LLMTransport {
 			// finer boundary was invisible upstream and consumers had to treat
 			// turnComplete as if it meant generation-final.
 			if (content.generationComplete) {
-				if (this._genState !== 'idle') this._genState = 'terminal';
+				this.endGeneration('generationComplete');
 				this.callbacks.onGenerationComplete?.();
 				if (this.onGenerationComplete) this.onGenerationComplete();
 			}

@@ -461,15 +461,25 @@ export class VoiceSession {
 		}
 
 		// Wire onModelTurnStart for STT commit trigger
-		this.transport.onModelTurnStart = () => {
-			// Restored now that the transport tracks a generation instead of a
-			// boolean turnComplete clears: this fires once per generation, so a
-			// consumer can key per-answer state on it. A late tool call no
-			// longer arrives here claiming to be a new turn.
-			this.eventBus.publish('turn.start', {
+		// The generation pair. NOT turn.start/turn.end: turn.end is turnComplete,
+		// which fires while the generation is still draining its tool tail, so a
+		// consumer keying candidates on turn.* closes before the tail arrives.
+		// generationId comes from the transport, which is what decides the
+		// boundary — so start, end and reason cannot drift apart.
+		this.transport.onGenerationStart = (generationId: string) => {
+			this.eventBus.publish('generation.start', {
 				sessionId: this.config.sessionId,
-				turnId: `turn_${this.turnId}`,
+				generationId,
 			});
+		};
+		this.transport.onGenerationEnd = (generationId, reason) => {
+			this.eventBus.publish('generation.end', {
+				sessionId: this.config.sessionId,
+				generationId,
+				reason,
+			});
+		};
+		this.transport.onModelTurnStart = () => {
 			if (this.sttProvider && !this._commitFiredForTurn) {
 				this._commitFiredForTurn = true;
 				this.sttProvider.commit(this.turnId);
