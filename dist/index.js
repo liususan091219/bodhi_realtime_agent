@@ -1320,7 +1320,7 @@ var ToolCallRouter = class {
   }
   /** Dispatch incoming tool calls to the appropriate handler. */
   handleToolCalls(calls) {
-    const names = calls.map((c) => c.name).join(", ");
+    const names = calls.map((c) => `${c.name}#${c.id}`).join(", ");
     this.deps.log(`Tool calls from LLM: [${names}]`);
     this.deps.transcriptManager.flushInput();
     this.deps.transcriptManager.saveOutputPrefix();
@@ -2392,8 +2392,30 @@ var GeminiLiveTransport = class {
   config;
   /** Resolves when setupComplete fires — used to make connect() await Gemini readiness. */
   setupResolver = null;
-  /** Tracks whether onModelTurnStart has already fired for the current turn. */
-  _modelTurnStarted = false;
+  /**
+   * Where the current generation is. A generation is the unit a consumer
+   * builds per-answer state on; it is NOT a Gemini turn.
+   *
+   *   idle                    --modelTurn|toolCall-->  active
+   *   active                  --turnComplete------->   draining
+   *   active|draining         --generationComplete-->  terminal
+   *   active|draining         --interrupted-------->   terminal
+   *   draining                --modelTurn---------->   active  (NEW generation)
+   *   terminal                --modelTurn|toolCall-->  active  (NEW generation)
+   *
+   * turnComplete used to clear a boolean here, so a tool call arriving after
+   * it was necessarily relabelled the start of a new model turn even when it
+   * was this generation's own tail. Identity now survives turnComplete.
+   * Only provider events move this — nothing here times or gaps a boundary.
+   */
+  _genState = "idle";
+  /**
+   * Identity of the generation the state above refers to. Its own counter,
+   * NOT the session's turnId: turnId increments at turnComplete, so a
+   * generation still draining would report its end under the next turn's id.
+   */
+  _genSeq = 0;
+  _genId = "gen_0";
   // --- LLMTransport static properties ---
   capabilities = {
     messageTruncation: false,
@@ -2423,6 +2445,9 @@ var GeminiLiveTransport = class {
   onError;
   onClose;
   onModelTurnStart;
+  onGenerationStart;
+  onGenerationEnd;
+  onGenerationComplete;
   onGoAway;
   onResumptionUpdate;
   onGroundingMetadata;
@@ -2538,8 +2563,42 @@ var GeminiLiveTransport = class {
       clearTimeout(timer);
     }
   }
+  /**
+   * Open a generation if provider output means a new one has begun. Called by
+   * every path that produces model output, so "when does a generation start"
+   * has one answer.
+   *
+   * `audioOpensNew` is the one asymmetry: from `draining`, a tool call is this
+   * generation's tail, but model audio cannot be — the model speaking again is
+   * a new answer. That rule is what makes the machine unable to wedge if
+   * generationComplete never arrives.
+   */
+  beginGenerationIfNew(audioOpensNew) {
+    if (this._genState === "active") return;
+    if (this._genState === "draining" && !audioOpensNew) return;
+    if (this._genState === "draining") this.endGeneration("superseded");
+    this._genState = "active";
+    this._genId = `gen_${this._genSeq}`;
+    this.callbacks.onModelTurnStart?.(this._genId);
+    if (this.onModelTurnStart) this.onModelTurnStart(this._genId);
+    this.callbacks.onGenerationStart?.(this._genId);
+    if (this.onGenerationStart) this.onGenerationStart(this._genId);
+  }
+  /**
+   * Close the current generation. The single exit, so every terminal reason
+   * fires exactly one generation.end and cannot fire a second.
+   */
+  endGeneration(reason) {
+    if (this._genState !== "active" && this._genState !== "draining") return;
+    this._genState = "terminal";
+    const id = this._genId;
+    this._genSeq++;
+    this.callbacks.onGenerationEnd?.(id, reason);
+    if (this.onGenerationEnd) this.onGenerationEnd(id, reason);
+  }
   async disconnect() {
-    this._modelTurnStarted = false;
+    this.endGeneration("disconnected");
+    this._genState = "idle";
     if (this.session) {
       try {
         await this.session.close();
@@ -2800,11 +2859,7 @@ var GeminiLiveTransport = class {
     if (msg.serverContent) {
       const content = msg.serverContent;
       if (content.modelTurn?.parts) {
-        if (!this._modelTurnStarted) {
-          this._modelTurnStarted = true;
-          this.callbacks.onModelTurnStart?.();
-          if (this.onModelTurnStart) this.onModelTurnStart();
-        }
+        this.beginGenerationIfNew(true);
         for (const part of content.modelTurn.parts) {
           if (part.inlineData?.data) {
             this.callbacks.onAudioOutput?.(part.inlineData.data);
@@ -2826,22 +2881,24 @@ var GeminiLiveTransport = class {
           this.onOutputTranscription(content.outputTranscription.text);
       }
       if (content.interrupted) {
+        this.endGeneration("interrupted");
         this.callbacks.onInterrupted?.();
         if (this.onInterrupted) this.onInterrupted();
       }
+      if (content.generationComplete) {
+        this.endGeneration("generationComplete");
+        this.callbacks.onGenerationComplete?.();
+        if (this.onGenerationComplete) this.onGenerationComplete();
+      }
       if (content.turnComplete) {
-        this._modelTurnStarted = false;
+        if (this._genState === "active") this._genState = "draining";
         this.callbacks.onTurnComplete?.();
         if (this.onTurnComplete) this.onTurnComplete();
       }
       return;
     }
     if (msg.toolCall?.functionCalls?.length) {
-      if (!this._modelTurnStarted) {
-        this._modelTurnStarted = true;
-        this.callbacks.onModelTurnStart?.();
-        if (this.onModelTurnStart) this.onModelTurnStart();
-      }
+      this.beginGenerationIfNew(false);
       this.callbacks.onToolCall?.(msg.toolCall.functionCalls);
       if (this.onToolCall) this.onToolCall(msg.toolCall.functionCalls);
       return;
@@ -3219,6 +3276,19 @@ var VoiceSession = class _VoiceSession {
         "[ShadowSTT] ignored \u2014 sttProvider already replaces built-in transcription (nothing to shadow)"
       );
     }
+    this.transport.onGenerationStart = (generationId) => {
+      this.eventBus.publish("generation.start", {
+        sessionId: this.config.sessionId,
+        generationId
+      });
+    };
+    this.transport.onGenerationEnd = (generationId, reason) => {
+      this.eventBus.publish("generation.end", {
+        sessionId: this.config.sessionId,
+        generationId,
+        reason
+      });
+    };
     this.transport.onModelTurnStart = () => {
       if (this.sttProvider && !this._commitFiredForTurn) {
         this._commitFiredForTurn = true;
@@ -3446,8 +3516,9 @@ var VoiceSession = class _VoiceSession {
       this._commitFiredForTurn = false;
     }
     this.transcriptManager.flush();
+    const endedTurnIdStr = `turn_${this.turnId}`;
     this.turnId++;
-    const turnIdStr = `turn_${this.turnId}`;
+    const turnIdStr = endedTurnIdStr;
     this.log(`Turn complete: ${turnIdStr}`);
     this.eventBus.publish("turn.end", {
       sessionId: this.config.sessionId,
