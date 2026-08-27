@@ -168,58 +168,137 @@ describe('turn lifecycle identity (real session)', () => {
 		expect(ends).toEqual(['turn_0']); // was 'turn_1'
 	});
 
-	it('a toolCall after turnComplete re-fires onModelTurnStart — known defect, pinned', async () => {
-		// CHARACTERIZATION, not an endorsement. The transport tracks "a model
-		// turn is underway" with a boolean that turnComplete clears, so a tool
-		// call arriving after turnComplete is necessarily relabelled the start
-		// of a new model turn. It may well be the tail of the generation that
-		// just ended — the transport cannot currently tell.
-		//
-		// This is why nothing here publishes 'turn.start' off onModelTurnStart:
-		// a consumer keying per-generation state on it would open a second
-		// candidate for one answer. Fixing the boundary is a separate change;
-		// this test pins the current behaviour so that change has to flip it.
+	// ---- generation boundary (the state machine) ----------------------------
+	//
+	// These assert a TRACE, not a count. Counting is not enough: before this
+	// change `audio → turnComplete → toolCall → audio` also produced two
+	// starts, but as one bogus start (the tool tail) plus one real one. Same
+	// number, different composition. The trace names the event each start
+	// fired on, so a test cannot pass for the wrong reason.
+
+	const AUDIO = {
+		serverContent: {
+			modelTurn: { parts: [{ inlineData: { data: 'AAAA', mimeType: 'audio/pcm' } }] },
+		},
+	};
+	const TOOL_CALL = {
+		toolCall: { functionCalls: [{ id: 'fc_1', name: 'get_weather', args: { city: 'Boston' } }] },
+	};
+	const TURN_COMPLETE = { serverContent: { turnComplete: true } };
+	const GEN_COMPLETE = { serverContent: { generationComplete: true } };
+	const INTERRUPTED = { serverContent: { interrupted: true } };
+
+	/**
+	 * Drive a real session through a labelled provider script and return the
+	 * labels of the events that opened a generation.
+	 */
+	async function startsFiredOn(
+		port: number,
+		sessionId: string,
+		script: [string, unknown][],
+	): Promise<{ trace: string[]; published: string[] }> {
 		session = new VoiceSession({
-			sessionId: 'sess_tool_tail',
+			sessionId,
 			userId: 'u',
 			apiKey: 'k',
 			agents: [createToolAgent()],
 			initialAgent: 'tool-agent',
-			port: 9889,
+			port,
 			model: mockModel,
 		});
-		const starts: string[] = [];
-		session.eventBus.subscribe('turn.start', (p) => starts.push(p.turnId));
-
+		const published: string[] = [];
+		session.eventBus.subscribe('turn.start', (p) => published.push(p.turnId));
 		await session.start();
 		await new Promise((r) => setTimeout(r, 50));
 
-		let modelTurnStarts = 0;
+		let fired = 0;
 		// biome-ignore lint/suspicious/noExplicitAny: reaching the transport for a callback assertion
-		((session as any).transport as { onModelTurnStart?: () => void }).onModelTurnStart = () => {
-			modelTurnStarts++;
+		const t = (session as any).transport as { onModelTurnStart?: () => void };
+		const inner = t.onModelTurnStart;
+		t.onModelTurnStart = () => {
+			fired++;
+			inner?.();
 		};
 
 		const { _getMessageHandler } = await import('@google/genai');
-		const fire = (_getMessageHandler as unknown as () => (msg: unknown) => void)();
+		const fire = (_getMessageHandler as unknown as () => (m: unknown) => void)();
+		const trace: string[] = [];
+		for (const [label, msg] of script) {
+			const before = fired;
+			fire(msg);
+			await new Promise((r) => setTimeout(r, 25));
+			if (fired > before) trace.push(label);
+		}
+		await new Promise((r) => setTimeout(r, 40));
+		return { trace, published };
+	}
 
-		fire({
-			serverContent: {
-				modelTurn: { parts: [{ inlineData: { data: 'AAAA', mimeType: 'audio/pcm' } }] },
-			},
-		});
-		await new Promise((r) => setTimeout(r, 20));
-		fire({ serverContent: { turnComplete: true } });
-		await new Promise((r) => setTimeout(r, 20));
-		fire({
-			toolCall: {
-				functionCalls: [{ id: 'fc_1', name: 'get_weather', args: { city: 'Boston' } }],
-			},
-		});
-		await new Promise((r) => setTimeout(r, 50));
+	it('a toolCall after turnComplete stays in the SAME generation', async () => {
+		// The defect this change exists for: turnComplete cleared the "a turn is
+		// underway" boolean, so the tool call that finishes an answer was
+		// relabelled the start of a new model turn — one answer, two candidates
+		// downstream. Before: ['audio', 'toolCall'].
+		const { trace, published } = await startsFiredOn(9889, 'sess_tool_tail', [
+			['audio', AUDIO],
+			['turnComplete', TURN_COMPLETE],
+			['toolCall', TOOL_CALL],
+		]);
+		expect(trace).toEqual(['audio']);
+		expect(published).toEqual(['turn_0']);
+	});
 
-		expect(modelTurnStarts).toBe(2); // the defect: one generation, two "starts"
-		expect(starts).toEqual([]); // and this PR publishes no turn.start off it
+	it('the answer built from a tool result IS a new generation', async () => {
+		// The other half: identity surviving turnComplete must not swallow the
+		// next real answer. The model speaking again cannot be the tail of a
+		// completed turn, so audio from `draining` opens a new generation.
+		// Before this change the count was also 2 — but as ['audio','toolCall'],
+		// crediting the tool tail and missing the answer entirely.
+		const { trace } = await startsFiredOn(9890, 'sess_tool_answer', [
+			['audio-1', AUDIO],
+			['turnComplete', TURN_COMPLETE],
+			['toolCall', TOOL_CALL],
+			['audio-2', AUDIO],
+		]);
+		expect(trace).toEqual(['audio-1', 'audio-2']);
+	});
+
+	it('generationComplete ends the generation; the next output opens a new one', async () => {
+		// Before: ['audio', 'toolCall'] — right count, and right here by luck,
+		// since the boolean happened to be clear. The trace pins WHY.
+		const { trace } = await startsFiredOn(9891, 'sess_gen_terminal', [
+			['audio', AUDIO],
+			['generationComplete', GEN_COMPLETE],
+			['turnComplete', TURN_COMPLETE],
+			['toolCall', TOOL_CALL],
+		]);
+		expect(trace).toEqual(['audio', 'toolCall']);
+	});
+
+	it('an interrupt ends the generation', async () => {
+		// Barge-in: nothing after it belongs to the interrupted answer. Before
+		// this change handleInterrupted left the boolean set, so the next
+		// output produced NO start at all — trace was ['audio'].
+		const { trace } = await startsFiredOn(9892, 'sess_interrupt_terminal', [
+			['audio', AUDIO],
+			['interrupted', INTERRUPTED],
+			['toolCall', TOOL_CALL],
+		]);
+		expect(trace).toEqual(['audio', 'toolCall']);
+	});
+
+	it('does not wedge when generationComplete never arrives', async () => {
+		// The machine must not depend on generationComplete being reliable: I
+		// have NOT verified that Gemini always sends it. Three plain turns with
+		// only turnComplete must still be three generations.
+		const { trace } = await startsFiredOn(9893, 'sess_no_gencomplete', [
+			['audio-1', AUDIO],
+			['turnComplete-1', TURN_COMPLETE],
+			['audio-2', AUDIO],
+			['turnComplete-2', TURN_COMPLETE],
+			['audio-3', AUDIO],
+			['turnComplete-3', TURN_COMPLETE],
+		]);
+		expect(trace).toEqual(['audio-1', 'audio-2', 'audio-3']);
 	});
 
 	it('generationComplete reaches the transport callback', async () => {

@@ -462,6 +462,14 @@ export class VoiceSession {
 
 		// Wire onModelTurnStart for STT commit trigger
 		this.transport.onModelTurnStart = () => {
+			// Restored now that the transport tracks a generation instead of a
+			// boolean turnComplete clears: this fires once per generation, so a
+			// consumer can key per-answer state on it. A late tool call no
+			// longer arrives here claiming to be a new turn.
+			this.eventBus.publish('turn.start', {
+				sessionId: this.config.sessionId,
+				turnId: `turn_${this.turnId}`,
+			});
 			if (this.sttProvider && !this._commitFiredForTurn) {
 				this._commitFiredForTurn = true;
 				this.sttProvider.commit(this.turnId);
