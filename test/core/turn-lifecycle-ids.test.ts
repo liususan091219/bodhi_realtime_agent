@@ -109,11 +109,16 @@ describe('turn lifecycle ids', () => {
 		await new Promise((r) => setTimeout(r, 50));
 
 		let fired = 0;
+		// WRAP, do not replace. Replacing the transport's own handler disables
+		// whatever VoiceSession registered there, and a guard that silently stops
+		// covering the site it guards is the kind nobody re-audits.
 		// biome-ignore lint/suspicious/noExplicitAny: reaching the transport for a callback assertion
-		((session as any).transport as { onGenerationComplete?: () => void }).onGenerationComplete =
-			() => {
-				fired++;
-			};
+		const t = (session as any).transport as { onGenerationComplete?: () => void };
+		const prev = t.onGenerationComplete;
+		t.onGenerationComplete = () => {
+			fired++;
+			prev?.();
+		};
 
 		const { _getMessageHandler } = await import('@google/genai');
 		const fire = (_getMessageHandler as unknown as () => (m: unknown) => void)();
