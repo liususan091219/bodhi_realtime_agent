@@ -70,6 +70,8 @@ export interface GeminiTransportCallbacks {
 	onInterrupted?(): void;
 	/** Model started a new response turn (first audio or tool call). */
 	onModelTurnStart?(): void;
+	/** The model finished generating. Distinct from, and earlier than, turnComplete. */
+	onGenerationComplete?(): void;
 	/** Transcription of user's spoken input. */
 	onInputTranscription?(text: string): void;
 	/** Transcription of model's spoken output. */
@@ -140,6 +142,7 @@ export class GeminiLiveTransport implements LLMTransport {
 	onError?: (error: LLMTransportError) => void;
 	onClose?: (code?: number, reason?: string) => void;
 	onModelTurnStart?: () => void;
+	onGenerationComplete?: () => void;
 	onGoAway?: (timeLeft: string) => void;
 	onResumptionUpdate?: (handle: string, resumable: boolean) => void;
 	onGroundingMetadata?: (metadata: Record<string, unknown>) => void;
@@ -634,6 +637,15 @@ export class GeminiLiveTransport implements LLMTransport {
 			if (content.interrupted) {
 				this.callbacks.onInterrupted?.();
 				if (this.onInterrupted) this.onInterrupted();
+			}
+			// Gemini sends generationComplete when the MODEL FINISHED GENERATING,
+			// separately from turnComplete. bodhi read only the latter, so the
+			// finer boundary was invisible upstream and consumers had to treat
+			// turnComplete as if it meant generation-final. Surfaced, not acted on:
+			// nothing below changes what turnComplete does.
+			if (content.generationComplete) {
+				this.callbacks.onGenerationComplete?.();
+				if (this.onGenerationComplete) this.onGenerationComplete();
 			}
 			if (content.turnComplete) {
 				this._modelTurnStarted = false;

@@ -462,6 +462,16 @@ export class VoiceSession {
 
 		// Wire onModelTurnStart for STT commit trigger
 		this.transport.onModelTurnStart = () => {
+			// 'turn.start' was declared in the event map and published by nothing,
+			// so a consumer building per-generation state had an end and an
+			// interrupt but never a beginning — and had to invent one from the
+			// first frame it happened to see. This is the real start: the
+			// transport fires it on the first modelTurn part or the first toolCall
+			// of a generation. Observability only; no existing behaviour moves.
+			this.eventBus.publish('turn.start', {
+				sessionId: this.config.sessionId,
+				turnId: `turn_${this.turnId}`,
+			});
 			if (this.sttProvider && !this._commitFiredForTurn) {
 				this._commitFiredForTurn = true;
 				this.sttProvider.commit(this.turnId);
@@ -765,8 +775,14 @@ export class VoiceSession {
 		}
 
 		this.transcriptManager.flush();
+		// The id of the turn that just ENDED, captured before the counter moves.
+		// This read `turn_${this.turnId}` AFTER the increment, so every turn.end
+		// named the turn about to start. A consumer keying a per-generation record
+		// on it therefore filed audio under one id and the matching
+		// turn.interrupted under another, and could never join them.
+		const endedTurnIdStr = `turn_${this.turnId}`;
 		this.turnId++;
-		const turnIdStr = `turn_${this.turnId}`;
+		const turnIdStr = endedTurnIdStr;
 		this.log(`Turn complete: ${turnIdStr}`);
 		this.eventBus.publish('turn.end', {
 			sessionId: this.config.sessionId,

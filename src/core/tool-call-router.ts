@@ -48,7 +48,10 @@ export class ToolCallRouter {
 
 	/** Dispatch incoming tool calls to the appropriate handler. */
 	handleToolCalls(calls: Array<{ id: string; name: string; args: Record<string, unknown> }>): void {
-		const names = calls.map((c) => c.name).join(', ');
+		// Log the ids, not just the names. Without them a tool call that arrives
+		// after turnComplete cannot be joined to anything after the fact, so
+		// "which generation did this belong to" was unanswerable from a log.
+		const names = calls.map((c) => `${c.name}#${c.id}`).join(', ');
 		this.deps.log(`Tool calls from LLM: [${names}]`);
 		// Flush user's input transcript before tool calls so it appears first
 		// in conversation context and logs. Safe because Gemini only calls tools
