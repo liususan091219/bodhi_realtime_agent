@@ -40,7 +40,10 @@ const echoAgent = (): MainAgent => ({ name: 'echo', instructions: 'echo', tools:
 describe('turn lifecycle ids', () => {
 	let session: VoiceSession | null = null;
 	afterEach(async () => {
-		if (session) { await session.close(); session = null; }
+		if (session) {
+			await session.close();
+			session = null;
+		}
 	});
 
 	it('start, interrupted and end of ONE turn all carry the SAME id', async () => {
@@ -53,8 +56,13 @@ describe('turn lifecycle ids', () => {
 		// The 1-based pairing is the contract turn.start established; this aligns
 		// the third event to it rather than re-numbering the other two.
 		session = new VoiceSession({
-			sessionId: 'sess_ids', userId: 'u', apiKey: 'k',
-			agents: [echoAgent()], initialAgent: 'echo', port: 9887, model: mockModel,
+			sessionId: 'sess_ids',
+			userId: 'u',
+			apiKey: 'k',
+			agents: [echoAgent()],
+			initialAgent: 'echo',
+			port: 9887,
+			model: mockModel,
 		});
 		const starts: string[] = [];
 		const interrupted: string[] = [];
@@ -68,7 +76,11 @@ describe('turn lifecycle ids', () => {
 		const { _getMessageHandler } = await import('@google/genai');
 		const fire = (_getMessageHandler as unknown as () => (m: unknown) => void)();
 
-		fire({ serverContent: { modelTurn: { parts: [{ inlineData: { data: 'AAAA', mimeType: 'audio/pcm' } }] } } });
+		fire({
+			serverContent: {
+				modelTurn: { parts: [{ inlineData: { data: 'AAAA', mimeType: 'audio/pcm' } }] },
+			},
+		});
 		await new Promise((r) => setTimeout(r, 20));
 		fire({ serverContent: { interrupted: true } });
 		await new Promise((r) => setTimeout(r, 20));
@@ -77,7 +89,7 @@ describe('turn lifecycle ids', () => {
 
 		expect(starts).toEqual(['turn_1']);
 		expect(ends).toEqual(['turn_1']);
-		expect(interrupted).toEqual(['turn_1']);   // was 'turn_0'
+		expect(interrupted).toEqual(['turn_1']); // was 'turn_0'
 	});
 
 	it('generationComplete reaches the transport callback', async () => {
@@ -85,15 +97,23 @@ describe('turn lifecycle ids', () => {
 		// read, so the finer boundary was invisible upstream. Surfaced only —
 		// nothing in this change consumes it.
 		session = new VoiceSession({
-			sessionId: 'sess_gen', userId: 'u', apiKey: 'k',
-			agents: [echoAgent()], initialAgent: 'echo', port: 9888, model: mockModel,
+			sessionId: 'sess_gen',
+			userId: 'u',
+			apiKey: 'k',
+			agents: [echoAgent()],
+			initialAgent: 'echo',
+			port: 9888,
+			model: mockModel,
 		});
 		await session.start();
 		await new Promise((r) => setTimeout(r, 50));
 
 		let fired = 0;
 		// biome-ignore lint/suspicious/noExplicitAny: reaching the transport for a callback assertion
-		((session as any).transport as { onGenerationComplete?: () => void }).onGenerationComplete = () => { fired++; };
+		((session as any).transport as { onGenerationComplete?: () => void }).onGenerationComplete =
+			() => {
+				fired++;
+			};
 
 		const { _getMessageHandler } = await import('@google/genai');
 		const fire = (_getMessageHandler as unknown as () => (m: unknown) => void)();
